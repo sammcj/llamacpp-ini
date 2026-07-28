@@ -1,6 +1,6 @@
 # llamacpp-ini
 
-llama-server router presets and a sync script for a nested LM Studio model tree.
+llama-server router presets and a sync script for a nested LM Studio style model tree.
 
 `llama-server --models-dir` doesn't recurse, so LM Studio's `<publisher>/<repo>/<file>.gguf` layout is invisible to it. `sync-models.py` symlinks the tree flat, probes each GGUF with `llama-gguf`, and writes `.generated/router.ini` with per-model speculative decoding on top of the host's base preset.
 
