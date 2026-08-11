@@ -18,7 +18,7 @@ Problems solved:
      - embedded MTP  (nextn tensors in a full model, e.g. Qwen): the server
        self-drafts from the model itself -> inherits [*] spec-type=draft-mtp.
      - base + head   (no nextn in the model, but a separate MTP head exists,
-       e.g. Gemma 4): we pair them via `model-draft = <head>`.
+       e.g. Gemma 4): we pair them via `spec-draft-model = <head>`.
      - no MTP        (no nextn, no matching head): generative models fall back to
        ngram speculation; embedding models get spec-type=none, since a global
        draft-mtp would abort the load.
@@ -85,26 +85,20 @@ class Config:
     diffusion_arch: tuple[str, ...] = ("diffusion", "dream", "llada")  # only llama-diffusion-cli runs these
     cache_version: int = 3  # probe-cache schema; bump to invalidate old caches
 
-    # --- Size-tier thresholds, in GB (env: SIZE_SMALL_KV_GB / _PARALLEL_ / _CKPT_)
+    # --- Size-tier thresholds, in GB (env: SIZE_SMALL_KV_GB / SIZE_CKPT_GB) ---
     # They stack: a model can match more than one tier. See SIZE_TIERS for wiring.
     small_kv_gb: int = field(default=40, metadata={"env": "SIZE_SMALL_KV_GB", "conv": int})  # under this: upgrade KV cache
-    parallel_gb: int = field(default=50, metadata={"env": "SIZE_PARALLEL_GB", "conv": int})  # over this: pin parallel
     ckpt_gb: int = field(default=80, metadata={"env": "SIZE_CKPT_GB", "conv": int})  # over this: cap ctx + checkpoints
 
     # --- What each size tier writes (the override values themselves) ----------
     small_kv_qwen: str = "bf16"  # KV cache type for Qwen under small_kv_gb (Qwen handles bf16 well)
     small_kv_other: str = "f16"  # KV cache type for every other model under small_kv_gb
-    big_parallel: str = "1"  # parallel = ? for models over parallel_gb
     ckpt_checkpoints: str = "32"  # ctx-checkpoints for models over ckpt_gb
     ckpt_ctx_size: int = 65000  # ctx-size for models over ckpt_gb
 
     @property
     def small_kv_bytes(self) -> int:
         return self.small_kv_gb * GB
-
-    @property
-    def parallel_bytes(self) -> int:
-        return self.parallel_gb * GB
 
     @property
     def ckpt_bytes(self) -> int:
@@ -137,8 +131,8 @@ class Config:
         return self.gen_dir / f"probe-cache-v{self.cache_version}.tsv"
 
     def __post_init__(self) -> None:
-        if not (self.small_kv_gb < self.parallel_gb < self.ckpt_gb):
-            raise ValueError("size tiers must be ordered: small_kv < parallel < ckpt")
+        if not self.small_kv_gb < self.ckpt_gb:
+            raise ValueError("size tiers must be ordered: small_kv < ckpt")
 
     @classmethod
     def load(cls, **cli_overrides) -> "Config":
@@ -172,7 +166,6 @@ def _kv_override(name: str, cfg: Config) -> dict[str, str]:
 
 SIZE_TIERS: list[SizeTier] = [
     SizeTier("small-kv", lambda b, c: b < c.small_kv_bytes, _kv_override),
-    SizeTier("parallel", lambda b, c: b > c.parallel_bytes, lambda _n, c: {"parallel": c.big_parallel}),
     SizeTier(
         "ckpt",
         lambda b, c: b > c.ckpt_bytes,
@@ -277,12 +270,12 @@ class Prober:
 
 
 # --------------------------------------------------------------------------
-# Model records. The five-way classification is the enum; model-draft only
+# Model records. The five-way classification is the enum; spec-draft-model only
 # exists for PAIRED, so it hangs off the record, not a side table.
 # --------------------------------------------------------------------------
 class ModelKind(Enum):
     EMBEDDED_MTP = auto()  # self-drafts; inherits the global spec-type
-    PAIRED = auto()  # base wired to a separate MTP head via model-draft
+    PAIRED = auto()  # base wired to a separate MTP head via spec-draft-model
     NGRAM = auto()  # no MTP: model-free ngram speculation fallback
     NO_SPEC = auto()  # embedding model; speculation is meaningless
 
@@ -599,11 +592,11 @@ class Sync:
             "; MTP is ON by default ([*] spec-type = draft-mtp). MTP-active models also\n"
             "; get tags = MTP so the web UI badges them (the picker merges server tags\n"
             "; with name-parsed tokens). Embedded-MTP (e.g. Qwen) need only the tag;\n"
-            "; base+head models (e.g. Gemma) also need model-draft. Generative models\n"
+            "; base+head models (e.g. Gemma) also need spec-draft-model. Generative models\n"
             "; with no MTP fall back to ngram speculation (spec-default, tags = ngram);\n"
             "; embedding models get spec-type = none (speculation is meaningless there).\n"
             f"; Size tiers, merged into the model's own section: under {c.small_kv_gb} GB -> KV cache\n"
-            f"; {c.small_kv_qwen} (Qwen) or {c.small_kv_other} (others); over {c.parallel_gb} GB -> parallel = {c.big_parallel}; over {c.ckpt_gb} GB ->\n"
+            f"; {c.small_kv_qwen} (Qwen) or {c.small_kv_other} (others); over {c.ckpt_gb} GB ->\n"
             f"; ctx-checkpoints = {c.ckpt_checkpoints} and ctx-size = {c.ckpt_ctx_size}.\n"
             "; Each multimodal model (one with an mmproj) is tagged vision and also gets a\n"
             "; -no-mmproj twin: a weights-only farm entry that loads text-only (no vision\n"
@@ -623,7 +616,7 @@ class Sync:
         if paired:
             parts.append("\n\n; --- base models paired with a separate MTP head ---")
             for m in paired:
-                body = f"spec-type   = draft-mtp\nmodel-draft = {m.draft_head}\n{emit(m)}"
+                body = f"spec-type        = draft-mtp\nspec-draft-model = {m.draft_head}\n{emit(m)}"
                 parts.append(f"\n\n[{m.name}]\n{body}".rstrip("\n"))
 
         if ngram:
@@ -676,7 +669,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dest", type=Path, help="flat staging dir (env MODELS_DIR)")
     ap.add_argument("--llama-gguf", dest="llama_gguf", help="llama-gguf binary (env LLAMA_GGUF)")
     ap.add_argument("--small-kv-gb", dest="small_kv_gb", type=int, help="KV-upgrade threshold, GB (env SIZE_SMALL_KV_GB)")
-    ap.add_argument("--parallel-gb", dest="parallel_gb", type=int, help="parallel=1 threshold, GB (env SIZE_PARALLEL_GB)")
     ap.add_argument("--ckpt-gb", dest="ckpt_gb", type=int, help="ctx-checkpoint threshold, GB (env SIZE_CKPT_GB)")
     return ap.parse_args()
 
