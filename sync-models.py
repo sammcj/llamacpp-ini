@@ -28,7 +28,7 @@ Problems solved:
 
 3. Diffusion-arch GGUFs (diffusion-gemma, dream, llada, ...) cannot load in
    llama-server at all. We keep them out of the farm and list them in
-   .generated/diffusion-models.tsv for run-diffusion.sh.
+   .generated/diffusion-models.tsv for use with llama-diffusion-cli.
 
 Nothing is copied; only symlinks. Re-run whenever models change.
 
@@ -95,6 +95,15 @@ class Config:
     small_kv_other: str = "f16"  # KV cache type for every other model under small_kv_gb
     ckpt_checkpoints: str = "32"  # ctx-checkpoints for models over ckpt_gb
     ckpt_ctx_size: int = 65000  # ctx-size for models over ckpt_gb
+
+    # --- Chat template fix for Qwen 3.5+ (env: QWEN_CHAT_TEMPLATE) ------------
+    # The templates shipped inside Qwen 3.5+ GGUFs are broken (tool calls and
+    # thinking blocks); point those models at the corrected jinja instead.
+    qwen_template: Path = field(
+        default=Path.home() / "git" / "Qwen-Fixed-Chat-Templates" / "chat_template.jinja",
+        metadata={"env": "QWEN_CHAT_TEMPLATE", "conv": Path},
+    )
+    qwen_template_min: tuple[int, int] = (3, 5)  # lowest Qwen version that gets it
 
     @property
     def small_kv_bytes(self) -> int:
@@ -180,6 +189,31 @@ def size_overrides(name: str, weight_bytes: int, cfg: Config) -> dict[str, str]:
         if tier.applies(weight_bytes, cfg):
             out.update(tier.make(name, cfg))
     return out
+
+
+# --------------------------------------------------------------------------
+# Chat-template override: Qwen 3.5 and newer ship broken in-GGUF templates.
+# --------------------------------------------------------------------------
+# Matches Qwen3.5, qwen-3.6, Qwen_Qwen3.8, ThinkingCap-Qwen3.6-27B, ... The
+# version is optional-minor so a bare "Qwen4" reads as 4.0 (still newer).
+QWEN_VERSION_RE = re.compile(r"(?i)qwen[._-]?(\d+)(?:\.(\d+))?")
+
+
+def qwen_version(name: str) -> tuple[int, int] | None:
+    """Highest Qwen version in a model name, or None if it names no Qwen.
+
+    Highest, not first: "Qwen2.5-coder-distill-Qwen3.6" is a 3.6 model, and a
+    publisher prefix ("Qwen_Qwen3.6-27B") repeats the vendor token harmlessly.
+    """
+    versions = [(int(maj), int(minor or 0)) for maj, minor in QWEN_VERSION_RE.findall(name)]
+    return max(versions) if versions else None
+
+
+def template_overrides(name: str, cfg: Config) -> dict[str, str]:
+    ver = qwen_version(name)
+    if ver is None or ver < cfg.qwen_template_min:
+        return {}
+    return {"chat-template-file": str(cfg.qwen_template)}
 
 
 # --------------------------------------------------------------------------
@@ -367,6 +401,8 @@ class Sync:
         self.linked = 0
         self.skipped_heads = 0
         self.nommproj_twins = 0
+        self.templated = 0
+        self.warned_template = False
 
     # -- classification helpers ------------------------------------------------
     def _is_head(self, g: Path) -> bool:
@@ -377,6 +413,23 @@ class Sync:
 
     def _is_diffusion(self, g: Path) -> bool:
         return self.prober.have_gguf and self.prober.probe(g).diffusion
+
+    def _template_overrides(self, name: str) -> dict[str, str]:
+        """Qwen 3.5+ chat-template fix, dropped if the jinja file is absent -
+        pointing chat-template-file at a missing path aborts the model load."""
+        out = template_overrides(name, self.cfg)
+        if out and not self.cfg.qwen_template.is_file():
+            if not self.warned_template:
+                print(
+                    f"warning: chat template '{self.cfg.qwen_template}' not found; "
+                    "Qwen 3.5+ models keep their built-in template.",
+                    file=sys.stderr,
+                )
+                self.warned_template = True
+            return {}
+        if out:
+            self.templated += 1
+        return out
 
     def _unique_name(self, desired: str, suffix: str, prefix: str) -> str:
         """A free farm name; fall back to <prefix>_<desired> on collision. The
@@ -407,6 +460,7 @@ class Sync:
             weight_bytes += f.stat().st_size
 
         overrides = size_overrides(name, weight_bytes, self.cfg)
+        overrides.update(self._template_overrides(name))
 
         if embedded:
             kind, tags = ModelKind.EMBEDDED_MTP, tags + ["MTP"]
@@ -582,7 +636,7 @@ class Sync:
             out = ""
             if m.tags:
                 out += f"tags = {','.join(m.tags)}\n"
-            out += "".join(f"{k:<16}= {v}\n" for k, v in m.overrides.items())
+            out += "".join(f"{k.ljust(16)} = {v}\n" for k, v in m.overrides.items())
             return out
 
         parts: list[str] = [c.base_ini.read_text(), "\n"]
@@ -598,13 +652,16 @@ class Sync:
             f"; Size tiers, merged into the model's own section: under {c.small_kv_gb} GB -> KV cache\n"
             f"; {c.small_kv_qwen} (Qwen) or {c.small_kv_other} (others); over {c.ckpt_gb} GB ->\n"
             f"; ctx-checkpoints = {c.ckpt_checkpoints} and ctx-size = {c.ckpt_ctx_size}.\n"
+            f"; Qwen {c.qwen_template_min[0]}.{c.qwen_template_min[1]} and newer (version parsed from the model name) get\n"
+            f"; chat-template-file = {c.qwen_template}, replacing the broken template\n"
+            "; baked into those GGUFs.\n"
             "; Each multimodal model (one with an mmproj) is tagged vision and also gets a\n"
             "; -no-mmproj twin: a weights-only farm entry that loads text-only (no vision\n"
             "; tag), with the same spec/size keys. Every model is also tagged with its quant\n"
             "; (Q6_K, UD-Q5_K_XL, ...) parsed from the GGUF filename, so the picker shows it.\n"
             "; Tags are comma-joined (e.g. Q6_K,MTP,vision).\n"
             "; Diffusion-arch models are excluded here (the router cannot load them);\n"
-            "; run them with run-diffusion.sh. See .generated/diffusion-models.tsv.\n"
+            "; see .generated/diffusion-models.tsv, run them with llama-diffusion-cli.\n"
             "; ===================================================================="
         )
 
@@ -646,8 +703,9 @@ class Sync:
         print(
             f"linked {self.linked} model(s): {mtp} embedded-MTP, {paired} base+head paired, "
             f"{ngram} ngram fallback, {nospec} no-spec (embeddings), {size_tiered} size-tiered, "
+            f"{self.templated} Qwen chat-template fix, "
             f"{self.nommproj_twins} no-mmproj twin(s); skipped {self.skipped_heads} MTP head(s), "
-            f"{len(self.diffusion)} diffusion model(s) (run via run-diffusion.sh)."
+            f"{len(self.diffusion)} diffusion model(s) (run via llama-diffusion-cli)."
         )
         print(f"router preset: {self.cfg.router_ini}")
 
@@ -670,6 +728,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--llama-gguf", dest="llama_gguf", help="llama-gguf binary (env LLAMA_GGUF)")
     ap.add_argument("--small-kv-gb", dest="small_kv_gb", type=int, help="KV-upgrade threshold, GB (env SIZE_SMALL_KV_GB)")
     ap.add_argument("--ckpt-gb", dest="ckpt_gb", type=int, help="ctx-checkpoint threshold, GB (env SIZE_CKPT_GB)")
+    ap.add_argument(
+        "--qwen-template",
+        dest="qwen_template",
+        type=Path,
+        help="chat template jinja for Qwen 3.5+ (env QWEN_CHAT_TEMPLATE)",
+    )
     return ap.parse_args()
 
 
