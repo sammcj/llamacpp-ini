@@ -105,6 +105,12 @@ class Config:
     )
     qwen_template_min: tuple[int, int] = (3, 5)  # lowest Qwen version that gets it
 
+    # --- Reasoning effort for Qwen 3.8+ ---------------------------------------
+    # 3.8 defaults to a high effort level that overthinks routine turns; medium
+    # is the useful default. Older Qwen have no effort knob in their template.
+    qwen_effort: str = "medium"
+    qwen_effort_min: tuple[int, int] = (3, 8)  # lowest Qwen version that gets it
+
     @property
     def small_kv_bytes(self) -> int:
         return self.small_kv_gb * GB
@@ -211,9 +217,14 @@ def qwen_version(name: str) -> tuple[int, int] | None:
 
 def template_overrides(name: str, cfg: Config) -> dict[str, str]:
     ver = qwen_version(name)
-    if ver is None or ver < cfg.qwen_template_min:
+    if ver is None:
         return {}
-    return {"chat-template-file": str(cfg.qwen_template)}
+    out: dict[str, str] = {}
+    if ver >= cfg.qwen_template_min:
+        out["chat-template-file"] = str(cfg.qwen_template)
+    if ver >= cfg.qwen_effort_min:
+        out["reasoning-effort"] = cfg.qwen_effort
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -418,7 +429,7 @@ class Sync:
         """Qwen 3.5+ chat-template fix, dropped if the jinja file is absent -
         pointing chat-template-file at a missing path aborts the model load."""
         out = template_overrides(name, self.cfg)
-        if out and not self.cfg.qwen_template.is_file():
+        if "chat-template-file" in out and not self.cfg.qwen_template.is_file():
             if not self.warned_template:
                 print(
                     f"warning: chat template '{self.cfg.qwen_template}' not found; "
@@ -426,7 +437,7 @@ class Sync:
                     file=sys.stderr,
                 )
                 self.warned_template = True
-            return {}
+            out.pop("chat-template-file")
         if out:
             self.templated += 1
         return out
@@ -655,6 +666,8 @@ class Sync:
             f"; Qwen {c.qwen_template_min[0]}.{c.qwen_template_min[1]} and newer (version parsed from the model name) get\n"
             f"; chat-template-file = {c.qwen_template}, replacing the broken template\n"
             "; baked into those GGUFs.\n"
+            f"; Qwen {c.qwen_effort_min[0]}.{c.qwen_effort_min[1]} and newer also get "
+            f"reasoning-effort = {c.qwen_effort}.\n"
             "; Each multimodal model (one with an mmproj) is tagged vision and also gets a\n"
             "; -no-mmproj twin: a weights-only farm entry that loads text-only (no vision\n"
             "; tag), with the same spec/size keys. Every model is also tagged with its quant\n"
