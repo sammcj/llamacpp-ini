@@ -105,12 +105,6 @@ class Config:
     )
     qwen_template_min: tuple[int, int] = (3, 5)  # lowest Qwen version that gets it
 
-    # --- Reasoning effort for Qwen 3.8+ ---------------------------------------
-    # 3.8 defaults to a high effort level that overthinks routine turns; medium
-    # is the useful default. Older Qwen have no effort knob in their template.
-    qwen_effort: str = "medium"
-    qwen_effort_min: tuple[int, int] = (3, 8)  # lowest Qwen version that gets it
-
     @property
     def small_kv_bytes(self) -> int:
         return self.small_kv_gb * GB
@@ -217,14 +211,9 @@ def qwen_version(name: str) -> tuple[int, int] | None:
 
 def template_overrides(name: str, cfg: Config) -> dict[str, str]:
     ver = qwen_version(name)
-    if ver is None:
+    if ver is None or ver < cfg.qwen_template_min:
         return {}
-    out: dict[str, str] = {}
-    if ver >= cfg.qwen_template_min:
-        out["chat-template-file"] = str(cfg.qwen_template)
-    if ver >= cfg.qwen_effort_min:
-        out["reasoning-effort"] = cfg.qwen_effort
-    return out
+    return {"chat-template-file": str(cfg.qwen_template)}
 
 
 # --------------------------------------------------------------------------
@@ -505,6 +494,26 @@ class Sync:
         self._finalise(twin, files[0].name, files)
 
     # -- passes ----------------------------------------------------------------
+    def _update_template_repo(self) -> None:
+        """Pull the latest Qwen chat-template fixes before wiring models to them.
+        Non-fatal: offline, a dirty checkout, or a plain non-git dir just means
+        the template already on disk is used."""
+        repo = self.cfg.qwen_template.parent
+        if not (repo / ".git").exists():
+            return
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(repo), "pull", "--ff-only", "--quiet"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if r.returncode != 0:
+                msg = r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}"
+                print(f"warning: git pull in '{repo}' failed: {msg}", file=sys.stderr)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            print(f"warning: git pull in '{repo}' failed: {e}", file=sys.stderr)
+
     def _check_src(self) -> None:
         if not self.cfg.src.is_dir():
             sys.exit(f"error: source models directory '{self.cfg.src}' not found.")
@@ -665,9 +674,8 @@ class Sync:
             f"; ctx-checkpoints = {c.ckpt_checkpoints} and ctx-size = {c.ckpt_ctx_size}.\n"
             f"; Qwen {c.qwen_template_min[0]}.{c.qwen_template_min[1]} and newer (version parsed from the model name) get\n"
             f"; chat-template-file = {c.qwen_template}, replacing the broken template\n"
-            "; baked into those GGUFs.\n"
-            f"; Qwen {c.qwen_effort_min[0]}.{c.qwen_effort_min[1]} and newer also get "
-            f"reasoning-effort = {c.qwen_effort}.\n"
+            "; baked into those GGUFs. That template already defaults Qwen 3.8's\n"
+            "; reasoning_effort to medium, so no reasoning-effort key is written here.\n"
             "; Each multimodal model (one with an mmproj) is tagged vision and also gets a\n"
             "; -no-mmproj twin: a weights-only farm entry that loads text-only (no vision\n"
             "; tag), with the same spec/size keys. Every model is also tagged with its quant\n"
@@ -723,6 +731,7 @@ class Sync:
         print(f"router preset: {self.cfg.router_ini}")
 
     def run(self) -> None:
+        self._update_template_repo()
         self._check_src()
         self._clean_dest()
         self._index_heads()
