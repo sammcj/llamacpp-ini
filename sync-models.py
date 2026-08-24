@@ -219,6 +219,16 @@ def template_overrides(name: str, cfg: Config) -> dict[str, str]:
     return {"chat-template-file": str(cfg.qwen_template)}
 
 
+def sampler_overrides(name: str) -> dict[str, str]:
+    """Qwen 3.8 recommended sampling: temp 1.0, top-p 0.95, top-k 20, min-p 0.0,
+    presence/repeat penalties off. Only the values that differ from llama-server
+    defaults (temp 0.8, top-k 40, min-p 0.05) or the base [*] (temp 0.6) are
+    written; top-p 0.95 and zero penalties are already the server defaults."""
+    if qwen_version(name) != (3, 8):
+        return {}
+    return {"temp": "1.0", "top-k": "20", "min-p": "0.0"}
+
+
 # --------------------------------------------------------------------------
 # GGUF probing (cached by path|size:mtime, TSV-compatible with the bash cache).
 # --------------------------------------------------------------------------
@@ -464,6 +474,7 @@ class Sync:
 
         overrides = size_overrides(name, weight_bytes, self.cfg)
         overrides.update(self._template_overrides(name))
+        overrides.update(sampler_overrides(name))
 
         if embedded:
             kind, tags = ModelKind.EMBEDDED_MTP, tags + ["MTP"]
