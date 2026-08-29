@@ -24,3 +24,6 @@ __pycache__/
 # Logs and temp
 *.log
 *.tmp
+
+.cache
+heads

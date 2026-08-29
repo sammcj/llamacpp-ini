@@ -16,12 +16,13 @@ Problems solved:
 2. The local scanner does NO MTP discovery. We probe every GGUF with llama-gguf
    and split models three ways:
      - embedded MTP  (nextn tensors in a full model, e.g. Qwen): the server
-       self-drafts from the model itself -> inherits [*]
-       spec-type=draft-mtp,ngram-mod (MTP plus draftless ngram; ngram wins the
-       step when it has a match, MTP covers the rest).
+       self-drafts from the model itself -> inherits [*] spec-type=draft-mtp.
+       No ngram-mod alongside MTP: draftless ngram wins the step whenever it
+       matches, displacing the higher-acceptance MTP drafts (measured -4 t/s
+       on qwen4exp at ~90% acceptance; see QWEN_NEXT.md).
      - base + head   (no nextn in the model, but a separate MTP head exists,
        e.g. Gemma 4): we pair them via `spec-draft-model = <head>` and re-state
-       the combo spec-type.
+       spec-type=draft-mtp.
      - no MTP        (no nextn, no matching head): generative models get
        ngram-only speculation; embedding models get spec-type=none, since a
        global draft-mtp would abort the load.
@@ -40,6 +41,7 @@ be overridden by its env var (shown in the field metadata) or a matching CLI
 flag; precedence is CLI > env > default. The size tiers are data too - see
 SIZE_TIERS - so changing what a tier does is a one-line edit.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -49,10 +51,10 @@ import shutil
 import socket
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from enum import Enum, auto
 from pathlib import Path
-from typing import Callable
 
 GB = 1024**3
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -79,31 +81,53 @@ class Config:
     """
 
     # --- Where things live (env: MODELS_SRC / MODELS_DIR / LLAMA_GGUF) --------
-    src: Path = field(default=Path.home() / ".lmstudio" / "models", metadata={"env": "MODELS_SRC", "conv": Path})
-    dest: Path = field(default=SCRIPT_DIR / "models", metadata={"env": "MODELS_DIR", "conv": Path})
-    llama_gguf: str = field(default="llama-gguf", metadata={"env": "LLAMA_GGUF", "conv": str})
+    src: Path = field(
+        default=Path.home() / ".lmstudio" / "models",
+        metadata={"env": "MODELS_SRC", "conv": Path},
+    )
+    dest: Path = field(
+        default=SCRIPT_DIR / "models", metadata={"env": "MODELS_DIR", "conv": Path}
+    )
+    llama_gguf: str = field(
+        default="llama-gguf", metadata={"env": "LLAMA_GGUF", "conv": str}
+    )
 
     # --- MTP / architecture detection ----------------------------------------
-    head_max_blocks: int = 8  # nextn tensors + <= this many blocks == head stub, not a model
-    diffusion_arch: tuple[str, ...] = ("diffusion", "dream", "llada")  # only llama-diffusion-cli runs these
+    head_max_blocks: int = (
+        8  # nextn tensors + <= this many blocks == head stub, not a model
+    )
+    diffusion_arch: tuple[str, ...] = (
+        "diffusion",
+        "dream",
+        "llada",
+    )  # only llama-diffusion-cli runs these
     cache_version: int = 3  # probe-cache schema; bump to invalidate old caches
 
     # --- Size-tier thresholds, in GB (env: SIZE_SMALL_KV_GB / SIZE_CKPT_GB) ---
     # They stack: a model can match more than one tier. See SIZE_TIERS for wiring.
-    small_kv_gb: int = field(default=40, metadata={"env": "SIZE_SMALL_KV_GB", "conv": int})  # under this: upgrade KV cache
-    ckpt_gb: int = field(default=80, metadata={"env": "SIZE_CKPT_GB", "conv": int})  # over this: cap ctx + checkpoints
+    small_kv_gb: int = field(
+        default=40, metadata={"env": "SIZE_SMALL_KV_GB", "conv": int}
+    )  # under this: upgrade KV cache
+    ckpt_gb: int = field(
+        default=80, metadata={"env": "SIZE_CKPT_GB", "conv": int}
+    )  # over this: cap ctx + checkpoints
 
     # --- What each size tier writes (the override values themselves) ----------
-    small_kv_qwen: str = "bf16"  # KV cache type for Qwen under small_kv_gb (Qwen handles bf16 well)
+    small_kv_qwen: str = (
+        "bf16"  # KV cache type for Qwen under small_kv_gb (Qwen handles bf16 well)
+    )
     small_kv_other: str = "f16"  # KV cache type for every other model under small_kv_gb
     ckpt_checkpoints: str = "32"  # ctx-checkpoints for models over ckpt_gb
-    ckpt_ctx_size: int = 65000  # ctx-size for models over ckpt_gb
+    ckpt_ctx_size: int = 131072  # ctx-size for models over ckpt_gb (128K)
 
     # --- Chat template fix for Qwen 3.5+ (env: QWEN_CHAT_TEMPLATE) ------------
     # The templates shipped inside Qwen 3.5+ GGUFs are broken (tool calls and
     # thinking blocks); point those models at the corrected jinja instead.
     qwen_template: Path = field(
-        default=Path.home() / "git" / "Qwen-Fixed-Chat-Templates" / "chat_template.jinja",
+        default=Path.home()
+        / "git"
+        / "Qwen-Fixed-Chat-Templates"
+        / "chat_template.jinja",
         metadata={"env": "QWEN_CHAT_TEMPLATE", "conv": Path},
     )
     qwen_template_min: tuple[int, int] = (3, 5)  # lowest Qwen version that gets it
@@ -147,7 +171,7 @@ class Config:
             raise ValueError("size tiers must be ordered: small_kv < ckpt")
 
     @classmethod
-    def load(cls, **cli_overrides) -> "Config":
+    def load(cls, **cli_overrides) -> Config:
         """Build a Config with precedence CLI arg > env var > field default."""
         values: dict = {}
         for f in fields(cls):
@@ -181,7 +205,10 @@ SIZE_TIERS: list[SizeTier] = [
     SizeTier(
         "ckpt",
         lambda b, c: b > c.ckpt_bytes,
-        lambda _n, c: {"ctx-checkpoints": c.ckpt_checkpoints, "ctx-size": str(c.ckpt_ctx_size)},
+        lambda _n, c: {
+            "ctx-checkpoints": c.ckpt_checkpoints,
+            "ctx-size": str(c.ckpt_ctx_size),
+        },
     ),
 ]
 
@@ -208,7 +235,9 @@ def qwen_version(name: str) -> tuple[int, int] | None:
     Highest, not first: "Qwen2.5-coder-distill-Qwen3.6" is a 3.6 model, and a
     publisher prefix ("Qwen_Qwen3.6-27B") repeats the vendor token harmlessly.
     """
-    versions = [(int(maj), int(minor or 0)) for maj, minor in QWEN_VERSION_RE.findall(name)]
+    versions = [
+        (int(maj), int(minor or 0)) for maj, minor in QWEN_VERSION_RE.findall(name)
+    ]
     return max(versions) if versions else None
 
 
@@ -245,7 +274,10 @@ class Prober:
         self.cfg = cfg
         self.have_gguf = shutil.which(cfg.llama_gguf) is not None
         if not self.have_gguf:
-            print(f"warning: '{cfg.llama_gguf}' not found; MTP detection disabled.", file=sys.stderr)
+            print(
+                f"warning: '{cfg.llama_gguf}' not found; MTP detection disabled.",
+                file=sys.stderr,
+            )
         self.cache: dict[str, str] = {}
         self._load_cache()
 
@@ -488,7 +520,9 @@ class Sync:
             else:
                 kind, tags = ModelKind.NGRAM, tags + ["ngram"]
 
-        model = Model(name=name, kind=kind, tags=tags, draft_head=head, overrides=overrides)
+        model = Model(
+            name=name, kind=kind, tags=tags, draft_head=head, overrides=overrides
+        )
         self.models.append(model)
         return model
 
@@ -563,7 +597,9 @@ class Sync:
             if self._is_head(g):
                 candidates.setdefault(normalise(b), []).append(g)
         for key, heads in candidates.items():
-            self.head_index[key] = min(heads, key=lambda p: (not p.name.startswith("mtp-"), p.name))
+            self.head_index[key] = min(
+                heads, key=lambda p: (not p.name.startswith("mtp-"), p.name)
+            )
 
     def _build_farm(self) -> None:
         """Pass 2: build the model farm and classify each model for MTP.
@@ -657,7 +693,9 @@ class Sync:
 
     # -- output ----------------------------------------------------------------
     def _write_diffusion_tsv(self) -> None:
-        self.cfg.diffusion_tsv.write_text("".join(f"{n}\t{p}\n" for n, p in self.diffusion))
+        self.cfg.diffusion_tsv.write_text(
+            "".join(f"{n}\t{p}\n" for n, p in self.diffusion)
+        )
 
     def _write_router_ini(self) -> None:
         c = self.cfg
@@ -677,9 +715,9 @@ class Sync:
         parts.append(
             "; ====================================================================\n"
             f"; AUTO-GENERATED by {PROG} - do not edit; re-run to refresh.\n"
-            "; Speculation is ON by default ([*] spec-type = draft-mtp,ngram-mod: MTP\n"
-            "; self-draft plus draftless ngram; ngram takes the step when it matches,\n"
-            "; MTP covers the rest). MTP-active models also get tags = MTP so the web UI\n"
+            "; Speculation is ON by default ([*] spec-type = draft-mtp: MTP self-draft\n"
+            "; only; ngram-mod alongside MTP displaces better drafts - see QWEN_NEXT.md).\n"
+            "; MTP-active models also get tags = MTP so the web UI\n"
             "; badges them (the picker merges server tags with name-parsed tokens).\n"
             "; Embedded-MTP (e.g. Qwen) need only the tag; base+head models (e.g. Gemma)\n"
             "; also need spec-draft-model. Generative models with no MTP keep ngram only\n"
@@ -703,21 +741,23 @@ class Sync:
         )
 
         if mtp:
-            parts.append("\n\n; --- embedded MTP (self-draft; inherits global spec-type) ---")
+            parts.append(
+                "\n\n; --- embedded MTP (self-draft; inherits global spec-type) ---"
+            )
             for m in mtp:
                 parts.append(f"\n\n[{m.name}]\n{emit(m)}".rstrip("\n"))
 
         if paired:
             parts.append("\n\n; --- base models paired with a separate MTP head ---")
             for m in paired:
-                body = f"spec-type        = draft-mtp,ngram-mod\nspec-draft-model = {m.draft_head}\n{emit(m)}"
+                body = f"spec-type        = draft-mtp\nspec-draft-model = {m.draft_head}\n{emit(m)}"
                 parts.append(f"\n\n[{m.name}]\n{body}".rstrip("\n"))
 
         if ngram:
             parts.append(
                 "\n\n; --- no MTP: model-free ngram speculation fallback ---\n"
-                "; spec-type = ngram-mod replaces the inherited draft-mtp,ngram-mod combo\n"
-                "; (draft-mtp would abort the load); no draft model needed, drafts from\n"
+                "; spec-type = ngram-mod replaces the inherited draft-mtp\n"
+                "; (which would abort the load); no draft model needed, drafts from\n"
                 "; recent-context n-grams."
             )
             for m in ngram:
@@ -761,12 +801,28 @@ class Sync:
 
 def parse_args() -> argparse.Namespace:
     summary = (__doc__ or "").splitlines()[0]
-    ap = argparse.ArgumentParser(description=summary, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--src", type=Path, help="source model tree to scan (env MODELS_SRC)")
+    ap = argparse.ArgumentParser(
+        description=summary, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "--src", type=Path, help="source model tree to scan (env MODELS_SRC)"
+    )
     ap.add_argument("--dest", type=Path, help="flat staging dir (env MODELS_DIR)")
-    ap.add_argument("--llama-gguf", dest="llama_gguf", help="llama-gguf binary (env LLAMA_GGUF)")
-    ap.add_argument("--small-kv-gb", dest="small_kv_gb", type=int, help="KV-upgrade threshold, GB (env SIZE_SMALL_KV_GB)")
-    ap.add_argument("--ckpt-gb", dest="ckpt_gb", type=int, help="ctx-checkpoint threshold, GB (env SIZE_CKPT_GB)")
+    ap.add_argument(
+        "--llama-gguf", dest="llama_gguf", help="llama-gguf binary (env LLAMA_GGUF)"
+    )
+    ap.add_argument(
+        "--small-kv-gb",
+        dest="small_kv_gb",
+        type=int,
+        help="KV-upgrade threshold, GB (env SIZE_SMALL_KV_GB)",
+    )
+    ap.add_argument(
+        "--ckpt-gb",
+        dest="ckpt_gb",
+        type=int,
+        help="ctx-checkpoint threshold, GB (env SIZE_CKPT_GB)",
+    )
     ap.add_argument(
         "--qwen-template",
         dest="qwen_template",
