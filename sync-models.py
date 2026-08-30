@@ -1,45 +1,38 @@
 #!/usr/bin/env python3
 """Prepare ~/.lmstudio/models for `llama-server --models-dir` + wire up MTP.
 
-Problems solved:
+Three things llama-server's own scanner cannot do:
 
-1. llama-server only scans the TOP level of --models-dir (loose *.gguf = a
-   single-file model, each immediate sub-dir = one multi-file model). It does
-   not recurse, so LM Studio's nested <publisher>/<repo>/<file>.gguf layout is
-   invisible. We flatten it into a symlink farm. Every quant is exposed as its
-   own model, named after its GGUF file (sharded models, one model split across
-   files, are named after their dir). A model name never depends on how many
-   siblings share its folder: the web UI keys favourites on the name, so
-   folder-derived names would silently rename - and unfavourite - a model as
-   soon as a second quant landed beside it.
+1. It reads only the TOP level of --models-dir (loose *.gguf = one model, each
+   immediate sub-dir = one multi-file model). LM Studio nests as
+   <publisher>/<repo>/<file>.gguf, so we flatten that into a symlink farm.
+   Every quant becomes its own model, named after its GGUF file (sharded models
+   after their dir) - never after the containing folder, however few siblings
+   it has: the web UI keys favourites on the name, so a folder-derived name
+   would silently rename, and unfavourite, a model the moment a second quant
+   landed beside it.
 
-2. The local scanner does NO MTP discovery. We probe every GGUF with llama-gguf
-   and split models three ways:
-     - embedded MTP  (nextn tensors in a full model, e.g. Qwen): the server
-       self-drafts from the model itself -> inherits [*] spec-type=draft-mtp.
-       No ngram-mod alongside MTP: draftless ngram wins the step whenever it
-       matches, displacing the higher-acceptance MTP drafts (measured -4 t/s
-       on qwen4exp at ~90% acceptance; see QWEN_NEXT.md).
-     - base + head   (no nextn in the model, but a separate MTP head exists,
-       e.g. Gemma 4): we pair them via `spec-draft-model = <head>` and re-state
-       spec-type=draft-mtp.
-     - no MTP        (no nextn, no matching head): generative models get
-       ngram-only speculation; embedding models get spec-type=none, since a
-       global draft-mtp would abort the load.
-   A standalone MTP head (a stub GGUF: nextn tensors, only a handful of
-   transformer blocks) is NOT a runnable model and is never linked as one.
-   Results are written to .generated/router.ini, the preset the server loads.
+2. It does no MTP discovery. We probe each GGUF with llama-gguf and classify it
+   (see ModelKind / KIND_SPEC below), which every model needs: the base preset
+   turns speculation on globally, and that aborts the load of anything with no
+   MTP unless we write it a spec-type of its own.
 
-3. Diffusion-arch GGUFs (diffusion-gemma, dream, llada, ...) cannot load in
-   llama-server at all. We keep them out of the farm and list them in
-   .generated/diffusion-models.tsv for use with llama-diffusion-cli.
+3. It cannot tell a runnable model from a file that merely looks like one.
+   Kept out of the farm entirely:
+     - MTP head stubs  - nextn tensors but only a handful of blocks; a head is
+                         a draft for some other model, not a model
+     - DFlash drafts   - arch = dflash; wire one by hand in the base ini via
+                         spec-type = draft-dflash (example in samm-mbp.ini)
+     - diffusion archs - cannot load in llama-server at all; listed in
+                         .generated/diffusion-models.tsv for llama-diffusion-cli
 
-Nothing is copied; only symlinks. Re-run whenever models change.
+Output is .generated/router.ini: the per-host base preset (<hostname>.ini) with
+one generated section per model appended. Nothing is copied, only symlinked;
+re-run whenever models change.
 
-Configuration lives in one place: the Config dataclass below. Every field can
-be overridden by its env var (shown in the field metadata) or a matching CLI
-flag; precedence is CLI > env > default. The size tiers are data too - see
-SIZE_TIERS - so changing what a tier does is a one-line edit.
+Tunables: paths and size thresholds in Config, each overridable by the env var
+in its metadata or the matching CLI flag (CLI > env > default). The override
+values those thresholds select are in the helpers just below Config.
 """
 
 from __future__ import annotations
@@ -101,7 +94,7 @@ class Config:
         "dream",
         "llada",
     )  # only llama-diffusion-cli runs these
-    cache_version: int = 3  # probe-cache schema; bump to invalidate old caches
+    cache_version: int = 4  # probe-cache schema; bump to invalidate old caches
 
     # --- Size-tier thresholds, in GB (env: SIZE_SMALL_KV_GB / SIZE_CKPT_GB) ---
     # They stack: a model can match more than one tier. See SIZE_TIERS for wiring.
@@ -186,6 +179,29 @@ class Config:
 
 
 # --------------------------------------------------------------------------
+# MTP classification -> the spec-type each kind needs. Lives here with the rest
+# of the per-model policy, not in the writer, which only formats what it is
+# given. EMBEDDED_MTP is absent on purpose: it inherits [*] spec-type.
+# --------------------------------------------------------------------------
+class ModelKind(Enum):
+    EMBEDDED_MTP = auto()  # nextn in the model (Qwen): self-drafts, inherits [*]
+    PAIRED = auto()  # no nextn, separate head exists (Gemma 4): spec-draft-model
+    NGRAM = auto()  # no MTP at all: model-free ngram speculation fallback
+    NO_SPEC = auto()  # embedding model; speculation is meaningless
+
+
+KIND_SPEC: dict[ModelKind, str] = {
+    # Re-stated (not inherited) so the pairing is readable in one section.
+    ModelKind.PAIRED: "draft-mtp",
+    # Replaces the inherited draft-mtp, which would abort the load. No draft
+    # model needed - it drafts from recent-context n-grams.
+    ModelKind.NGRAM: "ngram-mod",
+    # Speculation is meaningless for an embedding model.
+    ModelKind.NO_SPEC: "none",
+}
+
+
+# --------------------------------------------------------------------------
 # Size tiers as data: predicate -> ini overrides. Later tiers win on key clash.
 # --------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -248,6 +264,19 @@ def template_overrides(name: str, cfg: Config) -> dict[str, str]:
     return {"chat-template-file": str(cfg.qwen_template)}
 
 
+def mtp_draft_overrides(name: str) -> dict[str, str]:
+    """Draft tuning for embedded-MTP Qwen 3.8 models (caller checks the kind).
+    Measured on Qwen3.8-27B UD-Q6_K_L (M5 Max, ~450-token prompt): n-max 4 with
+    GPU-side draft sampling 37.9 t/s vs 36.7 at the inherited n-max 3; 5 and 6
+    were slower (rejected deep drafts waste the verify batch). Plain decode is
+    ~19-20 t/s; a DFlash2 draft measured 34.1 t/s on the same model, so
+    embedded MTP stays the default. The Flash-Next graft is unaffected: it is
+    not farm-scanned and keeps its own section (single-layer head, best at 6)."""
+    if qwen_version(name) != (3, 8):
+        return {}
+    return {"spec-draft-n-max": "4", "spec-draft-backend-sampling": "1"}
+
+
 def sampler_overrides(name: str) -> dict[str, str]:
     """Qwen 3.8 recommended sampling: temp 1.0, top-p 0.95, top-k 20, min-p 0.0,
     presence/repeat penalties off. Only the values that differ from llama-server
@@ -267,6 +296,7 @@ class ProbeResult:
     head: bool  # nextn tensors + few blocks -> a standalone MTP head, not a model
     diffusion: bool  # arch only runs under llama-diffusion-cli
     embed: bool  # carries <arch>.pooling_type -> an embedding model
+    dflash: bool  # arch = dflash -> a speculative draft, not a runnable model
 
 
 class Prober:
@@ -295,17 +325,18 @@ class Prober:
         if val is None:
             val = self._probe_raw(f)
             self.cache[key] = val
-        cnt, blk, dif, emb = self._parse(val)
+        cnt, blk, dif, emb, dfl = self._parse(val)
         nextn = cnt > 0
         return ProbeResult(
             nextn=nextn,
             head=nextn and blk <= self.cfg.head_max_blocks,
             diffusion=dif > 0,
             embed=emb > 0,
+            dflash=dfl > 0,
         )
 
     def _probe_raw(self, f: Path) -> str:
-        cnt = blk = dif = emb = 0
+        cnt = blk = dif = emb = dfl = 0
         if self.have_gguf:
             out = self._run_gguf(f)
             cnt = sum(1 for ln in out.splitlines() if re.search(r"name = .*nextn", ln))
@@ -315,9 +346,11 @@ class Prober:
             arch = am.group(0)[: -len(".block_count")] if am else ""
             if arch.startswith(self.cfg.diffusion_arch):
                 dif = 1
+            if arch == "dflash":
+                dfl = 1
             if any(".pooling_type" in ln for ln in out.splitlines()):
                 emb = 1
-        return f"{cnt}:{blk}:{dif}:{emb}"
+        return f"{cnt}:{blk}:{dif}:{emb}:{dfl}"
 
     def _run_gguf(self, f: Path) -> str:
         try:
@@ -331,8 +364,8 @@ class Prober:
             return ""
 
     @staticmethod
-    def _parse(val: str) -> tuple[int, int, int, int]:
-        # Pad older 2/3-field cache entries with zeros; treat any garbage as 0
+    def _parse(val: str) -> tuple[int, int, int, int, int]:
+        # Pad older short cache entries with zeros; treat any garbage as 0
         # (a corrupt cache degrades to "unknown", it never crashes the run).
         def to_int(x: str) -> int:
             try:
@@ -340,8 +373,8 @@ class Prober:
             except ValueError:
                 return 0
 
-        p = (val.split(":") + ["0", "0", "0", "0"])[:4]
-        return (to_int(p[0]), to_int(p[1]), to_int(p[2]), to_int(p[3]))
+        p = (val.split(":") + ["0"] * 5)[:5]
+        return (to_int(p[0]), to_int(p[1]), to_int(p[2]), to_int(p[3]), to_int(p[4]))
 
     def save_cache(self) -> None:
         lines = [f"{k}\t{v}" for k, v in sorted(self.cache.items())]
@@ -349,16 +382,9 @@ class Prober:
 
 
 # --------------------------------------------------------------------------
-# Model records. The five-way classification is the enum; spec-draft-model only
-# exists for PAIRED, so it hangs off the record, not a side table.
+# Model records. spec-draft-model only exists for PAIRED, so it hangs off the
+# record, not a side table.
 # --------------------------------------------------------------------------
-class ModelKind(Enum):
-    EMBEDDED_MTP = auto()  # self-drafts; inherits the global spec-type
-    PAIRED = auto()  # base wired to a separate MTP head via spec-draft-model
-    NGRAM = auto()  # no MTP: model-free ngram speculation fallback
-    NO_SPEC = auto()  # embedding model; speculation is meaningless
-
-
 @dataclass
 class Model:
     name: str
@@ -445,6 +471,7 @@ class Sync:
         self.diffusion: list[tuple[str, Path]] = []
         self.linked = 0
         self.skipped_heads = 0
+        self.skipped_dflash = 0
         self.nommproj_twins = 0
         self.templated = 0
         self.warned_template = False
@@ -458,6 +485,12 @@ class Sync:
 
     def _is_diffusion(self, g: Path) -> bool:
         return self.prober.have_gguf and self.prober.probe(g).diffusion
+
+    def _is_dflash(self, g: Path) -> bool:
+        if self.prober.have_gguf:
+            return self.prober.probe(g).dflash
+        # Fall back to the -DFlash filename convention when llama-gguf is absent.
+        return "dflash" in g.name.lower()
 
     def _template_overrides(self, name: str) -> dict[str, str]:
         """Qwen 3.5+ chat-template fix, dropped if the jinja file is absent -
@@ -511,6 +544,7 @@ class Sync:
         if embedded:
             kind, tags = ModelKind.EMBEDDED_MTP, tags + ["MTP"]
             head = None
+            overrides.update(mtp_draft_overrides(name))
         else:
             head = self.head_index.get(normalise(match))
             if head is not None:
@@ -622,6 +656,9 @@ class Sync:
             if self._is_head(g):
                 self.skipped_heads += 1
                 continue
+            if self._is_dflash(g):
+                self.skipped_dflash += 1
+                continue
             if self._is_diffusion(g):
                 self.diffusion.append((g.stem, g))
                 continue
@@ -649,6 +686,8 @@ class Sync:
                     first_shard = g
             elif self._is_head(g):
                 self.skipped_heads += 1
+            elif self._is_dflash(g):
+                self.skipped_dflash += 1
             else:
                 quants.append(g)
 
@@ -705,7 +744,16 @@ class Sync:
         nospec = [m for m in self.models if m.kind is ModelKind.NO_SPEC]
 
         def emit(m: Model) -> str:
+            """Key order is deliberate and must be kept: llama-server applies a
+            section top-down, so spec-type comes first (it decides whether the
+            draft keys mean anything), then spec-draft-model, then tags, then
+            the size/template/sampler overrides."""
             out = ""
+            spec = KIND_SPEC.get(m.kind)
+            if spec is not None:
+                out += f"{'spec-type'.ljust(16)} = {spec}\n"
+            if m.draft_head is not None:
+                out += f"{'spec-draft-model'.ljust(16)} = {m.draft_head}\n"
             if m.tags:
                 out += f"tags = {','.join(m.tags)}\n"
             out += "".join(f"{k.ljust(16)} = {v}\n" for k, v in m.overrides.items())
@@ -715,28 +763,15 @@ class Sync:
         parts.append(
             "; ====================================================================\n"
             f"; AUTO-GENERATED by {PROG} - do not edit; re-run to refresh.\n"
-            "; Speculation is ON by default ([*] spec-type = draft-mtp: MTP self-draft\n"
-            "; only; ngram-mod alongside MTP displaces better drafts - see QWEN_NEXT.md).\n"
-            "; MTP-active models also get tags = MTP so the web UI\n"
-            "; badges them (the picker merges server tags with name-parsed tokens).\n"
-            "; Embedded-MTP (e.g. Qwen) need only the tag; base+head models (e.g. Gemma)\n"
-            "; also need spec-draft-model. Generative models with no MTP keep ngram only\n"
-            "; (spec-type = ngram-mod, tags = ngram); embedding models get\n"
-            "; spec-type = none (speculation is meaningless there).\n"
-            f"; Size tiers, merged into the model's own section: under {c.small_kv_gb} GB -> KV cache\n"
-            f"; {c.small_kv_qwen} (Qwen) or {c.small_kv_other} (others); over {c.ckpt_gb} GB ->\n"
-            f"; ctx-checkpoints = {c.ckpt_checkpoints} and ctx-size = {c.ckpt_ctx_size}.\n"
-            f"; Qwen {c.qwen_template_min[0]}.{c.qwen_template_min[1]} and newer (version parsed from the model name) get\n"
-            f"; chat-template-file = {c.qwen_template}, replacing the broken template\n"
-            "; baked into those GGUFs. That template already defaults Qwen 3.8's\n"
-            "; reasoning_effort to medium, so no reasoning-effort key is written here.\n"
-            "; Each multimodal model (one with an mmproj) is tagged vision and also gets a\n"
-            "; -no-mmproj twin: a weights-only farm entry that loads text-only (no vision\n"
-            "; tag), with the same spec/size keys. Every model is also tagged with its quant\n"
-            "; (Q6_K, UD-Q5_K_XL, ...) parsed from the GGUF filename, so the picker shows it.\n"
-            "; Tags are comma-joined (e.g. Q6_K,MTP,vision).\n"
-            "; Diffusion-arch models are excluded here (the router cannot load them);\n"
-            "; see .generated/diffusion-models.tsv, run them with llama-diffusion-cli.\n"
+            f"; Why each key is here is documented in {PROG} itself (module docstring\n"
+            "; + the override helpers); read it there rather than a copy that drifts.\n"
+            "; Host-specific values in effect for this run:\n"
+            f";   KV cache upgrade below {c.small_kv_gb} GB: {c.small_kv_qwen} (Qwen) / {c.small_kv_other} (others)\n"
+            f";   above {c.ckpt_gb} GB: ctx-checkpoints = {c.ckpt_checkpoints}, ctx-size = {c.ckpt_ctx_size}\n"
+            f";   Qwen {c.qwen_template_min[0]}.{c.qwen_template_min[1]}+ chat-template-file = {c.qwen_template}\n"
+            "; Not listed here: diffusion-arch models (router cannot load them - see\n"
+            "; .generated/diffusion-models.tsv, run under llama-diffusion-cli) and DFlash\n"
+            "; drafts (wire manually in the base ini via spec-type = draft-dflash).\n"
             "; ===================================================================="
         )
 
@@ -750,8 +785,7 @@ class Sync:
         if paired:
             parts.append("\n\n; --- base models paired with a separate MTP head ---")
             for m in paired:
-                body = f"spec-type        = draft-mtp\nspec-draft-model = {m.draft_head}\n{emit(m)}"
-                parts.append(f"\n\n[{m.name}]\n{body}".rstrip("\n"))
+                parts.append(f"\n\n[{m.name}]\n{emit(m)}".rstrip("\n"))
 
         if ngram:
             parts.append(
@@ -761,14 +795,12 @@ class Sync:
                 "; recent-context n-grams."
             )
             for m in ngram:
-                body = f"spec-type = ngram-mod\n{emit(m)}"
-                parts.append(f"\n\n[{m.name}]\n{body}".rstrip("\n"))
+                parts.append(f"\n\n[{m.name}]\n{emit(m)}".rstrip("\n"))
 
         if nospec:
             parts.append("\n\n; --- no speculation (embedding models) ---")
             for m in nospec:
-                body = f"spec-type = none\n{emit(m)}"
-                parts.append(f"\n\n[{m.name}]\n{body}".rstrip("\n"))
+                parts.append(f"\n\n[{m.name}]\n{emit(m)}".rstrip("\n"))
 
         c.router_ini.write_text("".join(parts) + "\n")
 
@@ -783,6 +815,7 @@ class Sync:
             f"{ngram} ngram fallback, {nospec} no-spec (embeddings), {size_tiered} size-tiered, "
             f"{self.templated} Qwen chat-template fix, "
             f"{self.nommproj_twins} no-mmproj twin(s); skipped {self.skipped_heads} MTP head(s), "
+            f"{self.skipped_dflash} DFlash draft(s), "
             f"{len(self.diffusion)} diffusion model(s) (run via llama-diffusion-cli)."
         )
         print(f"router preset: {self.cfg.router_ini}")
