@@ -27,3 +27,7 @@ __pycache__/
 
 .cache
 heads
+
+*.gguf
+*.safetensors
+*.bak

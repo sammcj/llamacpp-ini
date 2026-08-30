@@ -2,7 +2,7 @@
 
 Qwen3.8-Flash-Next (arch `qwen4exp`, 125B-A6B) ships a jointly-trained single-layer MTP draft head, but llama.cpp master deliberately drops the `mtp.*` tensors at conversion, so no public GGUF quant can self-draft. This repo works around that with a grafted head and a PR-branch build. Result on the M5 Max: 41.6 t/s plain, ~70 t/s with `draft-mtp` at ~90% draft acceptance.
 
-Note the model's much-hyped "native ngram layers" (`qwen4exp.ple.*`, the `per_layer_token_embd` hashed 2/3-gram tables - 51GB at bf16, 27.4GB in our IQ4_XS quant) are a capacity mechanism in the forward pass, not speculative decoding. The MTP head is a separate DeepSeek/GLM-style nextn block (llama.cpp's current implementation drafts with dense attention; the sparse/QSA draft path is an open TODO upstream).
+Note the model's much-hyped "native ngram layers" (`qwen4exp.ple.*`, the `per_layer_token_embd` hashed 2/3-gram tables - ~95GiB at bf16, 26.8GiB at the IQ4_NL/Q4_0 most quants use, 50.7GiB at Q8_0 - the "51GB" figure community posts quote) are a capacity mechanism in the forward pass, not speculative decoding. The MTP head is a separate DeepSeek/GLM-style nextn block (llama.cpp's current implementation drafts with dense attention; the sparse/QSA draft path is an open TODO upstream).
 
 ## What is in place
 
@@ -21,29 +21,33 @@ PR #27836 creates the MTP context against the target model, never against an ext
 
 ## Benchmarks
 
-M5 Max 128GB, UD-IQ4_XS, C++ source-code prompts (prose lands a few t/s lower with the same ordering). Current config on the preset (LTO) build:
+M5 Max 128GB, UD-IQ4_XS, C++ source-code prompts (prose lands a few t/s lower with the same ordering). Current config on the preset (LTO) build. Benchmark convention from 2026-08-30 on: always pass `-ctk q8_0 -ctv q8_0` to match the served config (the router's global `cache-type-k/v = q8_0`); numbers before that date used f16 KV. Target-KV q8_0 is safe on this arch - the crash reports concern the draft KV quant only.
 
 | context      | no spec | draft-mtp | speedup |
 | ------------ | ------- | --------- | ------- |
 | short (n=200)| 41.6    | ~70       | +68%    |
+
+A UD-Q4_K_XL graft (`models/Qwen3.8-Flash-Next-MTP-Q4KXL-Merged-GGUF/`, q8_0 KV) measured 68.8 t/s short and 30.3 at 32K vs IQ4_XS's 70.1 / 34.1 (f16 KV) - parity short, ~11% slower at depth. Decode is bandwidth-bound, so the larger working set (~77 vs ~60GB) outweighs the faster Q4_K Metal kernels. It stays available as a quality option; IQ4_XS remains the speed default. Cold-cache warning: first load after a reboot fault-storms the SSD (single-digit t/s, OS lag) - warm it with a throwaway generation, and never benchmark two large quants alternately (page-cache churn hard-locked the machine once).
 
 Total memory, measured at 32K context:
 
 - **mlock (old config)**: ~89GB wired - the whole 87GB file plus ~1.9GB context buffers. Nothing evictable.
 - **mmap, ngram table demand-paged from SSD (current config)**: ~62-65GB steady state - ~60GB of non-PLE weights (read every token, so effectively always resident) + ~2GB context + a few GB of hot ngram rows. Only ~2GB of that is dirty/wired; the rest is file cache macOS can evict under pressure.
 
-Saving: roughly 25GB, the cold portion of the 27.4GB ngram table, at no measured speed cost (mlock vs mmap A/B: 46.3 vs 47.0 t/s avg). Context buffers at 32K break down as 768 MiB KV (12 attention layers, f16) + 288 MiB QSA indexer + 64 MiB MTP layer + 113 MiB recurrent state + ~700 MiB compute (~1.1 GiB of that scales with context length).
+Saving: roughly 25GB, the cold portion of the 27.4GB ngram table, at no measured speed cost (mlock vs mmap A/B: 46.3 vs 47.0 t/s avg). Context buffers at 32K break down as 768 MiB KV (12 attention layers, f16) + 288 MiB QSA indexer + 64 MiB MTP layer + 113 MiB recurrent state + ~700 MiB compute (~1.1 GiB of that scales with context length). The `ubatch-size = 2048` setting lifts the compute buffer to 1.8 GiB Metal + 0.3 GiB CPU (read from the load log; peak process memory not re-measured), so steady state lands ~1GB above the figures above - still ~63-66GB all up.
 
-The saving only exempts the ngram table - the MoE experts get touched broadly across a generation, so all non-PLE weights effectively stay resident. That caps which quants fit on 128GB (PLE looks Q8_0-fixed at ~27.4GB across these quants):
+The saving only exempts the ngram table - the MoE experts get touched broadly across a generation, so all non-PLE weights effectively stay resident. That caps which quants fit on 128GB. PLE sizes below were read from each file's GGUF header (`scratchpad gguf-remote-ple.py` trick: HTTP range requests, no download); the quantisers vary the PLE type per tier, so subtracting a fixed number misleads:
 
-| quant               | file   | non-PLE working set | verdict on 128GB                      |
-|---------------------|--------|---------------------|---------------------------------------|
-| UD-IQ4_XS (current) | 87 GB  | ~60 GB              | comfortable                           |
-| UD-Q4_K_XL          | 104 GB | ~76 GB              | comfortable                           |
-| Q5_K_S (bartowski)  | 119 GB | ~92 GB              | fits a 112GB budget, solo model only  |
-| UD-Q5_K_XL          | 147 GB | ~120 GB             | no: thrashes expert pages every token |
+| quant               | file      | PLE quant/size  | non-PLE working set | verdict on 128GB                     |
+|---------------------|-----------|-----------------|---------------------|--------------------------------------|
+| UD-IQ4_XS (current) | 87.2 GiB  | IQ4_NL 26.8 GiB | ~60 GiB             | comfortable                          |
+| UD-Q4_K_XL          | 103.7 GiB | IQ4_NL 26.8 GiB | ~77 GiB             | comfortable                          |
+| Q5_K_S (bartowski)  | 119.3 GiB | Q5_1 35.8 GiB   | ~84 GiB             | fits, ~90GB all up                   |
+| UD-Q5_K_XL          | 147.4 GiB | Q8_0 50.7 GiB   | ~97 GiB             | fits the 112GB budget, solo model    |
 
-Budget note: up to ~112GB total (model + KV) is acceptable on this 128GB machine, leaving ~16GB for the OS. Q5_K_S lands around 97-100GB all up; Q5_K_XL exceeds physical RAM outright.
+Budget note: up to ~112GB total (model + KV) is acceptable on this 128GB machine, leaving ~16GB for the OS. UD-Q5_K_XL lands around 100-103GB all up with context and hot ngram rows - the practical ceiling. UD-Q6_K_XL (157.5GiB) and beyond exceed it.
+
+For CUDA boxes the same trick applies via `-ot "per_layer_token_embd=CPU"` (PLE gathers stay on CPU). On 2x RTX 3090 (47.5GB usable) the non-PLE weights + ~2-3GB context must fit VRAM: bartowski IQ1_M (~40GiB non-PLE) fits, IQ2_XXS (~43GiB) barely, IQ3_XXS (~55GiB) does not. With enough system RAM, `--n-cpu-moe` spilling routed experts as well lifts the quality ceiling at reduced speed.
 
 The n-max sweep (plain Release build, before the ngram-mod drop; the preset build lifted the winner from 64.7 to ~70):
 
@@ -69,6 +73,10 @@ At context depth (llama-bench for PP and plain TG; llama-cli with source-code pr
 
 TG spec columns are the preset (LTO) build; the earlier plain Release build measured 41.4/34.0/31.2 combined, so the preset build is worth ~+16% at depth (LTO helps the per-step CPU-side draft/verify orchestration). PP and TG-plain columns are still from the plain build and read slightly low. The MTP gain thins from +45% (short) to ~15-20% at depth because verify batches pay the full attention/KV cost per step. Chat workloads with higher acceptance land higher still.
 
+**ubatch (2026-08-30, on the #27992 build):** `-ub 2048` lifts 32K prefill 570 -> 661 t/s (+16%; 1024 lands at 627) with TG unchanged, costing ~1.1GiB extra compute buffer (1.8GiB Metal at 2048 vs ~0.7 default). Wired as `ubatch-size = 2048` in both MTP model sections.
+
+**Long-context perf PRs #27992 vs #27977 (2026-08-30):** qwen4exp's PLE lookup calls `get_prev_tokens()` every decode step, which upstream scans all used KV cells - a cost that grows with context. Two open PRs attack it: #27992 (per-seq kv-cell position index) and #27977 (scan early-exit + QSA gather windows for generation + indexer sum-shape fix + bitmap used-cells). Either one beats the plain PR build at depth (+18% TG at 74K in the first A/B). Head to head on M5 Max (both-orders, q8 KV, ub 2048): TG identical within noise at 32K/74K/115K, but #27977 wins PP consistently at every depth - 685 vs 663 (32K), 511 vs 488 (74K), 409 vs 387 t/s (115K). **Carrying both regressed TG ~-18% at 32K** (27.6/29.0 vs 34.8/34.4), so `update-mtp-build.sh` merges exactly one: #27977. The CUDA-side headline gains (2.7x at 240K) do not transfer to Metal - unified memory already makes the CPU scan cheap - but the PP win and the correctness-adjacent fixes are free. Swap back to #27992 only if #27977 stops merging cleanly.
+
 At depth on novel code, draft-mtp alone and mtp+ngram-mod are within noise of each other (ngram-mod barely fires). Where they differ, ngram-mod loses: short context 70.1 vs 65.8 avg, echo-heavy agent task 51.8 vs 48.0 avg (both-orders A/B). Same mechanism as ngram-cache below - draftless ngram drafts take per-step priority, so wherever ngram-mod matches, its lower-acceptance drafts displace the 90%-acceptance MTP drafts. Hence `spec-type = draft-mtp` alone for this model; ngram-mod stays right for the models with no MTP head.
 
 For calibration, the only published M5 Max 128GB numbers for this model (heretik.io) are tg 33 t/s and pp512 966 at depth 0 - this setup is ~20% ahead plain and ~2.1x ahead with MTP on the preset build (69.3 t/s) at short context. Ruled out as bottlenecks: flash attention (auto resolves on, ±1 t/s), the PR build itself (~1% vs master), and the lazy-read ngram table (`--tensor-read-lazy off` made no difference, matching PR #27794's claim). The ~40 t/s plain decode is what a 125B model with per-token ngram gathers does on this hardware.
@@ -79,7 +87,7 @@ Two cautions from community reports: quantised KV cache crashes this arch (leave
 
 ## Moving forward
 
-- After pulling llama.cpp master, run `./update-mtp-build.sh` to bring the worktree along: it fetches the latest PR head, merges origin/master (falls back to the plain PR head on conflict), rebuilds, and exits early when nothing changed. It also detects the PR merging upstream and prints the retirement steps. It builds with the main repo's `local` cmake preset (LTO, native; symlinked into the worktree since `CMakeUserPresets.json` is untracked) and never runs `cmake --install`, so the PR binaries stay out of `~/.local`.
+- After pulling llama.cpp master, run `./update-mtp-build.sh` to bring the worktree along: it fetches the latest PR head, merges origin/master and PR #27977 (falls back gracefully when either stops merging cleanly), rebuilds, and exits early when nothing changed. It also detects the PR merging upstream and prints the retirement steps. It builds with the main repo's `local` cmake preset (LTO, native; symlinked into the worktree since `CMakeUserPresets.json` is untracked) and never runs `cmake --install`, so the PR binaries stay out of `~/.local`.
 - Watch [PR #27836](https://github.com/ggml-org/llama.cpp/pull/27836). When it merges: update the normal llama.cpp install, delete the `LLAMA_SERVER_BIN` override in `samm-mbp.env`, and remove the worktree (`git -C ~/git/llama.cpp worktree remove ../llama.cpp-pr27836`). The grafted model keeps working on the merged code.
 - The merged model does not load on master builds. If the server ever fails on it with "MTP" or `nextn` tensor errors, the binary is not the PR build.
 - Related fixes to watch: [#27897](https://github.com/ggml-org/llama.cpp/pull/27897) (combined draft-mtp + external draft init, fetched locally as branch `pr-27897-fix`; not needed for our no-`-md` path) and [#27572](https://github.com/ggml-org/llama.cpp/issues/27572) (acceptance collapse with parallel slots `-np N`; retest before enabling parallel serving on this model).
@@ -96,10 +104,14 @@ Save yourself the retry - all measured on this machine, controlled A/B where it 
 - **Expert-reduced self-draft** (same weights, `expert_used_count` 10 to 4 via a rewritten metadata shard, mmap-shared pages): elegant on paper, dead on 128GB - Metal wires each model instance's full mapping, so target + draft = 2x 90GB wired and the first decode OOMs (`kIOGPUCommandBufferCallbackErrorOutOfMemory`). Viable only with ~256GB, or if llama.cpp ever shares one model instance between target and draft contexts with per-context hparams.
 - **Downloading a trained EAGLE3/DFlash/DSpark draft**: none exists for qwen4exp (they exist for Qwen3.8-27B and others, wrong target). No small Qwen4-family sibling has been released.
 
+- **PLE ngram table in a Metal buffer** (`-ot "per_layer_token_embd\.weight=MTL0"`, hoping to kill the per-token CPU gather+sync): wash at short context (66.4 vs 65.7 avg over 4 runs/arm), worse at 32K (30.0 vs 34.2), costs 27GB wired. Unified memory already makes the CPU-side gather cheap; default placement stands.
+
 - **`spec-draft-n-min` above 0**: gating speculation on a minimum confident draft length measured monotonically worse (16K: 41.2/38.2/37.1 t/s at n-min 0/2/3) - at 90% acceptance a skipped spec round costs more than the verify batch it saves.
+
+- **Lower temperature for draft acceptance** (temp 0.6 vs the model card's 1.0): the sharper-target-distribution-lifts-acceptance theory did not show up in throughput - short context straddles noise (67.3/75.3 vs 73.5), 32K measured worse (26.5 vs 32.3, single pair). Acceptance already sits ~90%, so the headroom was small. Temp stays 1.0. Sampler chain ordering was checked too: llama.cpp already runs top-k first (cheap 248K-vocab cull), nothing to reorder.
 
 - **`ngram-cache` in the spec-type list**: measured on an agent-shaped file-rewrite task, it makes things worse (46.2 t/s current config, 38.0 with cache added, 34.0 replacing ngram-mod). Draftless ngram types take per-step priority, so the cache's frequency-ranked drafts displace the higher-quality MTP/ngram-mod drafts. A warmed static cache does not change the displacement problem.
 
 - **Implementing the QSA TODO in the MTP draft graph** (attempted 2026-08-29, no viable minimal change): the MTP context gets a plain blk.48 `llama_kv_cache` and cannot cheaply obtain the indexer context QSA requires; switching it to `llama_memory_hybrid_idx` breaks the draft driver's per-cycle partial rollback (`llama_memory_recurrent::seq_rm` refuses partial tail removal with `n_rs_seq = 0`, silently corrupting draft state), and the msa cache alternative means a 400+ line refactor of the trunk QSA path. Decisive point: per-draft-step cost at 32K is dominated by the 248K-vocab LM head (~600MB weight read) + MoE (~50MB); dense attention over 32K KV is ~32MB, under 5% of the step, so the ceiling is low single digits of t/s - below our benchmark noise floor. If ever revisited, the smallest path is making zero-layer recurrent `seq_rm` succeed on partial tail removal, then a hybrid-idx MTP context and `build_layer_attn` in `graph_mtp` (~60-80 lines) - but the audit of recurrent cell bookkeeping for the zero-layer case is the real cost. Worth a comment on PR #27836 noting the rollback blocker and cost profile.
 
-No levers left standing: the wired config (draft-mtp alone, n-max 6, p-min 0.7, backend sampling, preset build) is the measured optimum for this model in llama.cpp today. The next real speedup arrives from upstream (MTP draft-step batching, or a small Qwen4-family sibling model).
+No levers left standing: the wired config (draft-mtp alone, n-max 6, p-min 0.7, backend sampling, preset build + #27992) is the measured optimum for this model in llama.cpp today. The next real speedup arrives from upstream (MTP draft-step batching, or a small Qwen4-family sibling model).
