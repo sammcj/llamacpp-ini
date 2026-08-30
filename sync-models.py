@@ -89,6 +89,7 @@ class Config:
     head_max_blocks: int = (
         8  # nextn tensors + <= this many blocks == head stub, not a model
     )
+    probe_timeout: int = 120  # seconds per llama-gguf probe (it reads headers only)
     diffusion_arch: tuple[str, ...] = (
         "diffusion",
         "dream",
@@ -162,6 +163,12 @@ class Config:
     def __post_init__(self) -> None:
         if not self.small_kv_gb < self.ckpt_gb:
             raise ValueError("size tiers must be ordered: small_kv < ckpt")
+        # os.symlink stores its target verbatim and the kernel resolves a
+        # relative one against the link's directory, not our cwd - a relative
+        # --src would build a farm of dangling links. abspath, not resolve, so a
+        # symlinked source tree keeps the path the user recognises.
+        for name in ("src", "dest", "qwen_template"):
+            object.__setattr__(self, name, Path(os.path.abspath(getattr(self, name))))
 
     @classmethod
     def load(cls, **cli_overrides) -> Config:
@@ -257,6 +264,10 @@ def qwen_version(name: str) -> tuple[int, int] | None:
     return max(versions) if versions else None
 
 
+# Lowest Qwen version that gets the measured 3.8 draft/sampler tuning below.
+QWEN_TUNED_MIN = (3, 8)
+
+
 def template_overrides(name: str, cfg: Config) -> dict[str, str]:
     ver = qwen_version(name)
     if ver is None or ver < cfg.qwen_template_min:
@@ -271,8 +282,12 @@ def mtp_draft_overrides(name: str) -> dict[str, str]:
     were slower (rejected deep drafts waste the verify batch). Plain decode is
     ~19-20 t/s; a DFlash2 draft measured 34.1 t/s on the same model, so
     embedded MTP stays the default. The Flash-Next graft is unaffected: it is
-    not farm-scanned and keeps its own section (single-layer head, best at 6)."""
-    if qwen_version(name) != (3, 8):
+    not farm-scanned and keeps its own section (single-layer head, best at 6).
+
+    Gated >= 3.8, like the chat-template fix: an exact == would drop the tuning
+    silently the day a 3.9 lands. Re-measure when one does."""
+    ver = qwen_version(name)
+    if ver is None or ver < QWEN_TUNED_MIN:
         return {}
     return {"spec-draft-n-max": "4", "spec-draft-backend-sampling": "1"}
 
@@ -281,8 +296,10 @@ def sampler_overrides(name: str) -> dict[str, str]:
     """Qwen 3.8 recommended sampling: temp 1.0, top-p 0.95, top-k 20, min-p 0.0,
     presence/repeat penalties off. Only the values that differ from llama-server
     defaults (temp 0.8, top-k 40, min-p 0.05) or the base [*] (temp 0.6) are
-    written; top-p 0.95 and zero penalties are already the server defaults."""
-    if qwen_version(name) != (3, 8):
+    written; top-p 0.95 and zero penalties are already the server defaults.
+    Gated >= 3.8 for the reason in mtp_draft_overrides."""
+    ver = qwen_version(name)
+    if ver is None or ver < QWEN_TUNED_MIN:
         return {}
     return {"temp": "1.0", "top-k": "20", "min-p": "0.0"}
 
@@ -297,6 +314,7 @@ class ProbeResult:
     diffusion: bool  # arch only runs under llama-diffusion-cli
     embed: bool  # carries <arch>.pooling_type -> an embedding model
     dflash: bool  # arch = dflash -> a speculative draft, not a runnable model
+    ok: bool = True  # False = never probed; every flag above is "unknown", not "no"
 
 
 class Prober:
@@ -324,6 +342,18 @@ class Prober:
         val = self.cache.get(key)
         if val is None:
             val = self._probe_raw(f)
+            if val is None:
+                # Never cache an unprobed result: the key is path|size:mtime, so
+                # installing llama-gguf or clearing a transient failure does not
+                # change it - the misclassification would outlive its cause.
+                return ProbeResult(
+                    nextn=False,
+                    head=False,
+                    diffusion=False,
+                    embed=False,
+                    dflash=False,
+                    ok=False,
+                )
             self.cache[key] = val
         cnt, blk, dif, emb, dfl = self._parse(val)
         nextn = cnt > 0
@@ -335,33 +365,47 @@ class Prober:
             dflash=dfl > 0,
         )
 
-    def _probe_raw(self, f: Path) -> str:
-        cnt = blk = dif = emb = dfl = 0
-        if self.have_gguf:
-            out = self._run_gguf(f)
-            cnt = sum(1 for ln in out.splitlines() if re.search(r"name = .*nextn", ln))
-            blocks = [int(m) for m in re.findall(r"blk\.(\d+)\.", out)]
-            blk = max(blocks) if blocks else 0
-            am = re.search(r"[a-z0-9_-]+\.block_count", out)
-            arch = am.group(0)[: -len(".block_count")] if am else ""
-            if arch.startswith(self.cfg.diffusion_arch):
-                dif = 1
-            if arch == "dflash":
-                dfl = 1
-            if any(".pooling_type" in ln for ln in out.splitlines()):
-                emb = 1
+    def _probe_raw(self, f: Path) -> str | None:
+        """Classification counters for f, or None if it could not be probed."""
+        if not self.have_gguf:
+            return None
+        out = self._run_gguf(f)
+        if out is None:
+            return None
+        cnt = sum(1 for ln in out.splitlines() if re.search(r"name = .*nextn", ln))
+        blocks = [int(m) for m in re.findall(r"blk\.(\d+)\.", out)]
+        blk = max(blocks) if blocks else 0
+        am = re.search(r"[a-z0-9_-]+\.block_count", out)
+        arch = am.group(0)[: -len(".block_count")] if am else ""
+        dif = 1 if arch.startswith(self.cfg.diffusion_arch) else 0
+        dfl = 1 if arch == "dflash" else 0
+        emb = 1 if any(".pooling_type" in ln for ln in out.splitlines()) else 0
         return f"{cnt}:{blk}:{dif}:{emb}:{dfl}"
 
-    def _run_gguf(self, f: Path) -> str:
+    def _run_gguf(self, f: Path) -> str | None:
+        """llama-gguf's dump for f, or None if it did not run cleanly.
+
+        The returncode matters: llama-gguf aborts (134) on a malformed file
+        after printing part of its output, and that partial dump parses as a
+        plausible model - no nextn, no arch - so a head would look servable."""
         try:
             r = subprocess.run(
                 [self.cfg.llama_gguf, str(f), "r", "n"],
                 capture_output=True,
                 text=True,
+                timeout=self.cfg.probe_timeout,
             )
-            return r.stdout or ""
-        except OSError:
-            return ""
+        except (OSError, subprocess.TimeoutExpired) as e:
+            print(f"warning: probe of '{f}' failed: {e}", file=sys.stderr)
+            return None
+        if r.returncode != 0:
+            print(
+                f"warning: probe of '{f}' failed: {self.cfg.llama_gguf} exited "
+                f"{r.returncode}; treating it as unclassified.",
+                file=sys.stderr,
+            )
+            return None
+        return r.stdout or ""
 
     @staticmethod
     def _parse(val: str) -> tuple[int, int, int, int, int]:
@@ -416,11 +460,15 @@ def normalise(name: str) -> str:
     """A base-model identity key for pairing heads to models: lowercased, with
     quant / shard / format / variant tokens stripped. E.g. both
     "gemma-4-31B-it-MTP-Q8_0" and "gemma-4-31B-it-qat-UD-Q4_K_XL" -> gemma-4-31b-it.
+
+    The quant pattern covers IQ as well as Q: without the optional i, an
+    IQ-quantised file keeps its quant tokens (gemma-4-31b-it-iq4-xs), matches no
+    base identity, and silently falls back to ngram instead of pairing.
     """
     s = (name[:-5] if name.endswith(".gguf") else name).lower()
     s = re.sub(r"-[0-9]+-of-[0-9]+", "", s)
-    s = re.sub(r"[._-]q[0-9]+(_[0-9a-z]+)*", "", s)
-    s = re.sub(r"[._-](ud|k_xl|k_m|k_s|k_l|f16|bf16|fp16|f32|i1|imatrix)", "", s)
+    s = re.sub(r"[._-]i?q[0-9]+(_[0-9a-z]+)*", "", s)
+    s = re.sub(r"[._-](ud|k_xl|k_m|k_s|k_l|f16|bf16|fp16|f32|mxfp4|i1|imatrix)", "", s)
     s = s.replace("_", "-")
     tokens = [t for t in s.split("-") if t and t not in ("mtp", "qat", "gguf")]
     return "-".join(tokens)
@@ -447,11 +495,25 @@ def only_symlinks(d: Path) -> bool:
 
 
 def iter_ggufs(src: Path):
-    """Every real *.gguf under src (mirrors `find -L -type f`). followlinks so a
-    symlinked src tree (e.g. ~/.lmstudio/models -> ~/.cache/lm-studio/models) or
-    symlinked publisher dirs are scanned; the farm's own symlinks are excluded by
-    the is_symlink() guard below."""
-    for root, _, files in os.walk(src, followlinks=True):
+    """Every real *.gguf under src. followlinks so a symlinked src tree (e.g.
+    ~/.lmstudio/models -> ~/.cache/lm-studio/models) or symlinked publisher dirs
+    are scanned; the visited dev/inode set stops a symlink cycle looping forever.
+
+    Symlinked *files* are skipped (so not `find -L`): they are the farm's own
+    links, or a second route to a file the walk already yields under its real
+    path - linking both would give one model two farm names.
+    """
+    seen: set[tuple[int, int]] = set()
+    for root, dirs, files in os.walk(src, followlinks=True):
+        try:
+            st = os.stat(root)
+        except OSError:
+            dirs.clear()
+            continue
+        if (st.st_dev, st.st_ino) in seen:
+            dirs.clear()  # already walked this directory via another path
+            continue
+        seen.add((st.st_dev, st.st_ino))
         for fn in files:
             if fn.endswith(".gguf"):
                 p = Path(root) / fn
@@ -474,22 +536,27 @@ class Sync:
         self.skipped_dflash = 0
         self.nommproj_twins = 0
         self.templated = 0
+        self.size_tiered = 0
         self.warned_template = False
 
     # -- classification helpers ------------------------------------------------
     def _is_head(self, g: Path) -> bool:
-        if self.prober.have_gguf:
-            return self.prober.probe(g).head
-        # Fall back to the mtp- filename convention when llama-gguf is absent.
+        pr = self.prober.probe(g)
+        if pr.ok:
+            return pr.head
+        # Unprobed: fall back to the mtp- filename convention rather than assume
+        # "not a head" - a head admitted to the farm aborts on load.
         return g.name.startswith("mtp-") and g.name.endswith(".gguf")
 
     def _is_diffusion(self, g: Path) -> bool:
-        return self.prober.have_gguf and self.prober.probe(g).diffusion
+        # No filename convention to fall back on; unprobed reads as "not one".
+        return self.prober.probe(g).diffusion
 
     def _is_dflash(self, g: Path) -> bool:
-        if self.prober.have_gguf:
-            return self.prober.probe(g).dflash
-        # Fall back to the -DFlash filename convention when llama-gguf is absent.
+        pr = self.prober.probe(g)
+        if pr.ok:
+            return pr.dflash
+        # Fall back to the -DFlash filename convention (see _is_head).
         return "dflash" in g.name.lower()
 
     def _template_overrides(self, name: str) -> dict[str, str]:
@@ -505,24 +572,40 @@ class Sync:
                 )
                 self.warned_template = True
             out.pop("chat-template-file")
-        if out:
-            self.templated += 1
         return out
 
     def _unique_name(self, desired: str, suffix: str, prefix: str) -> str:
-        """A free farm name; fall back to <prefix>_<desired> on collision. The
-        first to claim a bare name keeps it, so callers must iterate in a stable
-        order (see build_farm) or a rename would orphan a web-UI favourite.
+        """A free farm name: the bare name, else <prefix>_<desired>, else a
+        numbered <prefix>_<desired>_N. The first to claim a bare name keeps it,
+        so callers must iterate in a stable order (see _build_farm) or a rename
+        would orphan a web-UI favourite. The numbered tail is there because the
+        prefixed name can collide too; returning it unchecked let force_symlink
+        silently overwrite the earlier model's link.
         """
-        target = self.cfg.dest / f"{desired}{suffix}"
-        if target.exists() or target.is_symlink():
-            return f"{prefix}_{desired}"
-        return desired
+
+        def free(n: str) -> bool:
+            t = self.cfg.dest / f"{n}{suffix}"
+            return not (t.exists() or t.is_symlink())
+
+        if free(desired):
+            return desired
+        prefixed = f"{prefix}_{desired}"
+        if free(prefixed):
+            return prefixed
+        n = 2
+        while not free(f"{prefixed}_{n}"):
+            n += 1
+        return f"{prefixed}_{n}"
 
     # -- model finalisation ----------------------------------------------------
-    def _finalise(self, name: str, match: str, files: list[Path]) -> Model:
+    def _finalise(
+        self, name: str, match: str, files: list[Path], twin: bool = False
+    ) -> Model:
         """Probe the model's file(s), record size-tier keys off the summed weight
         bytes (mmproj is never passed in), then classify it for MTP.
+
+        twin marks a -no-mmproj twin - a second view of a model already counted,
+        so it is left out of the summary counters.
         """
         tags: list[str] = []
         quant = extract_quant(match)  # quant first, so a badge reads "Q6_K MTP vision"
@@ -538,8 +621,12 @@ class Sync:
             weight_bytes += f.stat().st_size
 
         overrides = size_overrides(name, weight_bytes, self.cfg)
+        sized = bool(overrides)
         overrides.update(self._template_overrides(name))
         overrides.update(sampler_overrides(name))
+        if not twin:
+            self.size_tiered += sized
+            self.templated += "chat-template-file" in overrides
 
         if embedded:
             kind, tags = ModelKind.EMBEDDED_MTP, tags + ["MTP"]
@@ -573,7 +660,7 @@ class Sync:
             force_symlink(g, tdir / g.name)
         self.linked += 1
         self.nommproj_twins += 1
-        self._finalise(twin, files[0].name, files)
+        self._finalise(twin, files[0].name, files, twin=True)
 
     # -- passes ----------------------------------------------------------------
     def _update_template_repo(self) -> None:
@@ -599,13 +686,23 @@ class Sync:
     def _check_src(self) -> None:
         if not self.cfg.src.is_dir():
             sys.exit(f"error: source models directory '{self.cfg.src}' not found.")
+        # Checked here rather than at read time: the whole run is wasted work if
+        # the preset it extends is missing, and read_text would raise a bare
+        # traceback after the farm was already rebuilt.
+        if not self.cfg.base_ini.is_file():
+            sys.exit(
+                f"error: base preset '{self.cfg.base_ini}' not found "
+                "(set LLAMA_BASE_INI or add a <hostname>.ini)."
+            )
         self.cfg.dest.mkdir(parents=True, exist_ok=True)
         self.cfg.gen_dir.mkdir(parents=True, exist_ok=True)
 
     def _clean_dest(self) -> None:
         """Remove what we generated: top-level symlinks, plus per-quant/twin dirs
-        (those whose contents are entirely symlinks). Never touch real files or
-        directories the user placed here.
+        (those whose contents are entirely symlinks). Real files and real
+        directories placed here by hand survive - a hand-placed *symlink* does
+        not, since it is indistinguishable from one of ours; put a real file or
+        directory here instead (as models/Qwen3.8-Flash-Next-MTP-Merged-GGUF is).
         """
         dest = self.cfg.dest
         for p in list(dest.iterdir()):
@@ -642,17 +739,24 @@ class Sync:
         collision fallback (first one wins the bare name) depends on a stable
         order - unsorted, adding or removing a model could silently rename
         another, and the web UI keys favourites on the model name.
-        """
-        ggufs = sorted(iter_ggufs(self.cfg.src))
-        for d in sorted({p.parent for p in ggufs}):
-            if d == self.cfg.src:
-                self._process_toplevel(d)
-            else:
-                self._process_dir(d)
 
-    def _process_toplevel(self, d: Path) -> None:
+        Each directory is handed the files iter_ggufs already found for it,
+        rather than re-globbing: a glob would also pick up symlinked GGUFs that
+        iter_ggufs deliberately skips, so the same file could be linked twice
+        under two names depending on which pass saw it.
+        """
+        by_dir: dict[Path, list[Path]] = {}
+        for g in sorted(iter_ggufs(self.cfg.src)):
+            by_dir.setdefault(g.parent, []).append(g)
+        for d in sorted(by_dir):
+            if d == self.cfg.src:
+                self._process_toplevel(by_dir[d])
+            else:
+                self._process_dir(d, by_dir[d])
+
+    def _process_toplevel(self, ggufs: list[Path]) -> None:
         """Loose *.gguf at the top of the source tree: each is its own model."""
-        for g in sorted(d.glob("*.gguf")):
+        for g in ggufs:
             if self._is_head(g):
                 self.skipped_heads += 1
                 continue
@@ -667,19 +771,18 @@ class Sync:
             self.linked += 1
             self._finalise(name, g.name, [g])
 
-    def _process_dir(self, d: Path) -> None:
-        ggufs = sorted(d.glob("*.gguf"))
+    def _process_dir(self, d: Path, ggufs: list[Path]) -> None:
         if not ggufs:
             return
 
-        mmproj: Path | None = None
+        mmprojs: list[Path] = []
         first_shard: Path | None = None
         shards: list[Path] = []
         quants: list[Path] = []
         for g in ggufs:
             base = g.name
             if "mmproj" in base:
-                mmproj = g
+                mmprojs.append(g)
             elif "-of-" in base:
                 shards.append(g)
                 if "-00001-of-" in base:
@@ -693,20 +796,40 @@ class Sync:
 
         parent = d.parent.name
 
-        if first_shard is not None:
+        # A repo can ship more than one projector (mmproj-F16 beside mmproj-F32).
+        # Take the first sorted one so the choice is deterministic - last-wins on
+        # walk order silently changed which projector a model got.
+        mmproj = mmprojs[0] if mmprojs else None
+        if len(mmprojs) > 1:
+            print(
+                f"warning: '{d}' has {len(mmprojs)} mmproj files; using {mmproj.name}.",  # type: ignore[union-attr]
+                file=sys.stderr,
+            )
+
+        if shards and first_shard is None:
+            # Without shard 1 llama-server cannot load the set at all, and the
+            # loop below skips shards, so this would otherwise vanish silently.
+            print(
+                f"warning: '{d}' has {len(shards)} shard(s) but no -00001-of- "
+                "shard; skipping the sharded model (incomplete download?).",
+                file=sys.stderr,
+            )
+        elif first_shard is not None:
             # Sharded model == one model. Link the dir; probe every shard.
             if self._is_diffusion(first_shard):
                 self.diffusion.append((d.name, first_shard))
-                return
-            name = self._unique_name(d.name, "", parent)
-            force_symlink(d, self.cfg.dest / name)
-            self.linked += 1
-            model = self._finalise(name, first_shard.name, shards)
-            if mmproj is not None:
-                model.tags.append("vision")
-                self._link_twin(name, shards)
-            return
+            else:
+                name = self._unique_name(d.name, "", parent)
+                force_symlink(d, self.cfg.dest / name)
+                self.linked += 1
+                model = self._finalise(name, first_shard.name, shards)
+                if mmproj is not None:
+                    model.tags.append("vision")
+                    self._link_twin(name, shards)
 
+        # Loose quants are processed even when the dir also holds a sharded
+        # model: a repo commonly ships a sharded big quant beside single-file
+        # small ones, and returning early dropped every one of the latter.
         # Every quant is its own model, named after its GGUF file - never after
         # the containing dir, even when it is the only quant (see module docs).
         # With an mmproj we build a per-quant directory (model + mmproj) so
@@ -809,7 +932,7 @@ class Sync:
         paired = sum(1 for m in self.models if m.kind is ModelKind.PAIRED)
         ngram = sum(1 for m in self.models if m.kind is ModelKind.NGRAM)
         nospec = sum(1 for m in self.models if m.kind is ModelKind.NO_SPEC)
-        size_tiered = sum(1 for m in self.models if m.overrides)
+        size_tiered = self.size_tiered
         print(
             f"linked {self.linked} model(s): {mtp} embedded-MTP, {paired} base+head paired, "
             f"{ngram} ngram fallback, {nospec} no-spec (embeddings), {size_tiered} size-tiered, "
