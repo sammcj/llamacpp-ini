@@ -686,9 +686,7 @@ class Sync:
     def _check_src(self) -> None:
         if not self.cfg.src.is_dir():
             sys.exit(f"error: source models directory '{self.cfg.src}' not found.")
-        # Checked here rather than at read time: the whole run is wasted work if
-        # the preset it extends is missing, and read_text would raise a bare
-        # traceback after the farm was already rebuilt.
+        # Checked up front: at read time the farm has already been rebuilt.
         if not self.cfg.base_ini.is_file():
             sys.exit(
                 f"error: base preset '{self.cfg.base_ini}' not found "
@@ -699,10 +697,9 @@ class Sync:
 
     def _clean_dest(self) -> None:
         """Remove what we generated: top-level symlinks, plus per-quant/twin dirs
-        (those whose contents are entirely symlinks). Real files and real
-        directories placed here by hand survive - a hand-placed *symlink* does
-        not, since it is indistinguishable from one of ours; put a real file or
-        directory here instead (as models/Qwen3.8-Flash-Next-MTP-Merged-GGUF is).
+        (those whose contents are entirely symlinks). Real files and dirs placed
+        here by hand survive; a hand-placed *symlink* does not, being
+        indistinguishable from ours - place a real one, as the MTP graft is.
         """
         dest = self.cfg.dest
         for p in list(dest.iterdir()):
@@ -740,10 +737,9 @@ class Sync:
         order - unsorted, adding or removing a model could silently rename
         another, and the web UI keys favourites on the model name.
 
-        Each directory is handed the files iter_ggufs already found for it,
-        rather than re-globbing: a glob would also pick up symlinked GGUFs that
-        iter_ggufs deliberately skips, so the same file could be linked twice
-        under two names depending on which pass saw it.
+        Each directory is handed the files iter_ggufs found for it rather than
+        re-globbing, which would also pick up the symlinked GGUFs iter_ggufs
+        skips and link one file twice under two names.
         """
         by_dir: dict[Path, list[Path]] = {}
         for g in sorted(iter_ggufs(self.cfg.src)):
@@ -796,9 +792,8 @@ class Sync:
 
         parent = d.parent.name
 
-        # A repo can ship more than one projector (mmproj-F16 beside mmproj-F32).
-        # Take the first sorted one so the choice is deterministic - last-wins on
-        # walk order silently changed which projector a model got.
+        # A repo can ship two projectors (mmproj-F16 beside mmproj-F32); first
+        # sorted, so walk order cannot silently change which one a model gets.
         mmproj = mmprojs[0] if mmprojs else None
         if len(mmprojs) > 1:
             print(
@@ -807,8 +802,8 @@ class Sync:
             )
 
         if shards and first_shard is None:
-            # Without shard 1 llama-server cannot load the set at all, and the
-            # loop below skips shards, so this would otherwise vanish silently.
+            # Unloadable without shard 1, and the quant loop skips shards, so
+            # this would otherwise vanish silently.
             print(
                 f"warning: '{d}' has {len(shards)} shard(s) but no -00001-of- "
                 "shard; skipping the sharded model (incomplete download?).",
@@ -827,9 +822,8 @@ class Sync:
                     model.tags.append("vision")
                     self._link_twin(name, shards)
 
-        # Loose quants are processed even when the dir also holds a sharded
-        # model: a repo commonly ships a sharded big quant beside single-file
-        # small ones, and returning early dropped every one of the latter.
+        # Reached even when the dir also holds a sharded model: a repo commonly
+        # ships a sharded big quant beside single-file small ones.
         # Every quant is its own model, named after its GGUF file - never after
         # the containing dir, even when it is the only quant (see module docs).
         # With an mmproj we build a per-quant directory (model + mmproj) so
