@@ -6,7 +6,8 @@ set -euo pipefail
 # so the worktree keeps pace with daily master pulls, rebuilds, and tells you
 # when the PR has merged upstream so the whole arrangement can be retired.
 #
-# Usage: ./update-mtp-build.sh          (idempotent; skips rebuild when nothing changed)
+# Usage: ./update-mtp-build.sh    (nothing changed: prompts to rebuild anyway on a
+#                                  terminal, skips silently when non-interactive)
 
 REPO="${LLAMA_REPO:-${HOME}/git/llama.cpp}"
 WORKTREE="${LLAMA_MTP_WORKTREE:-${HOME}/git/llama.cpp-pr27836}"
@@ -46,8 +47,19 @@ if git -C "${REPO}" merge-base --is-ancestor "${PR_REF}" origin/master; then
 fi
 
 if [[ -f "${MARKER}" ]] && [[ "$(cat "${MARKER}")" == "${pr_head}+${master_head}+${pr2_head}" ]]; then
-  echo "Already built against this PR head and master. Nothing to do."
-  exit 0
+  echo "Already built against this PR head and master."
+  # Only offer the rebuild when someone is there to answer; piped or scheduled
+  # runs keep the old skip-and-exit behaviour rather than blocking on read.
+  if [[ ! -t 0 ]]; then
+    echo "Nothing to do."
+    exit 0
+  fi
+  read -r -p "Build anyway? (y/N) " reply || reply=""
+  if [[ ! "${reply}" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+    echo "Nothing to do."
+    exit 0
+  fi
+  echo "Rebuilding at the same revisions."
 fi
 
 echo "Updating ${BRANCH} to PR head ${pr_head:0:9}..."
@@ -76,8 +88,21 @@ fi
 [[ -e "${WORKTREE}/CMakeUserPresets.json" ]] \
   || ln -s "${REPO}/CMakeUserPresets.json" "${WORKTREE}/CMakeUserPresets.json"
 
+# Re-resolve OpenSSL on every configure. LLAMA_OPENSSL defaults ON, and CMake
+# caches the absolute library path it finds; Homebrew deletes the old Cellar
+# directory on upgrade, after which FindOpenSSL still reports OpenSSL_FOUND (the
+# cache vars are non-empty) but skips creating OpenSSL::SSL (the dylib is gone),
+# so configure fails with "links to OpenSSL::SSL but the target was not found".
+# Clearing the three path vars re-runs the search; OPENSSL_ROOT_DIR points it at
+# the versionless opt symlink, which brew repoints in place across upgrades.
+ssl_opts=(-UOPENSSL_INCLUDE_DIR -UOPENSSL_SSL_LIBRARY -UOPENSSL_CRYPTO_LIBRARY)
+if ssl_prefix="$(brew --prefix openssl@3 2>/dev/null)" && [[ -d "${ssl_prefix}" ]]; then
+  ssl_opts+=(-DOPENSSL_ROOT_DIR="${ssl_prefix}")
+fi
+
 echo "Building llama-server, llama-cli, llama-bench (preset: local)..."
-(cd "${WORKTREE}" && cmake --preset local >/dev/null)
+(cd "${WORKTREE}" && cmake --preset local "${ssl_opts[@]}" >/dev/null) \
+  || die "cmake configure failed"
 cmake --build "${WORKTREE}/build" --target llama-server llama-cli llama-bench -j \
   || die "build failed"
 
