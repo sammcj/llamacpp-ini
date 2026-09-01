@@ -46,8 +46,15 @@ if git -C "${REPO}" merge-base --is-ancestor "${PR_REF}" origin/master; then
   exit 0
 fi
 
-if [[ -f "${MARKER}" ]] && [[ "$(cat "${MARKER}")" == "${pr_head}+${master_head}+${pr2_head}" ]]; then
+# The marker records the revisions built, plus whether PR #PR2 made it in, so a
+# skipped run can still say that the existing build is missing it.
+marker_key="${pr_head}+${master_head}+${pr2_head}"
+
+if [[ -f "${MARKER}" ]] && [[ "$(cut -d' ' -f1 "${MARKER}")" == "${marker_key}" ]]; then
   echo "Already built against this PR head and master."
+  if [[ "$(cut -d' ' -f2 "${MARKER}")" == "MISSING" ]]; then
+    echo "warning: that build does NOT include PR #${PR2} (long-context perf)." >&2
+  fi
   # Only offer the rebuild when someone is there to answer; piped or scheduled
   # runs keep the old skip-and-exit behaviour rather than blocking on read.
   if [[ ! -t 0 ]]; then
@@ -65,21 +72,55 @@ fi
 echo "Updating ${BRANCH} to PR head ${pr_head:0:9}..."
 git -C "${WORKTREE}" checkout -q -B "${BRANCH}" "${PR_REF}"
 
-if git -C "${WORKTREE}" merge --no-edit origin/master >/dev/null 2>&1; then
-  echo "Merged origin/master (${master_head:0:9})."
-else
+# Merge a ref, reporting what actually broke. The old version sent conflict
+# output to /dev/null, so a dropped merge looked like a one-line warning with no
+# way to tell a trivial comment clash from a real code divergence.
+# rerere is enabled on this repo (rerere.enabled/autoupdate), so a conflict you
+# resolve by hand once is replayed automatically on later runs - worth doing,
+# since checkout -B above discards the branch every time.
+try_merge() {
+  local ref="${1}" label="${2}" out conflicts
+  if out="$(git -C "${WORKTREE}" merge --no-edit "${ref}" 2>&1)"; then
+    echo "Merged ${label}."
+    return 0
+  fi
+  conflicts="$(git -C "${WORKTREE}" diff --name-only --diff-filter=U)"
+  # rerere replays a recorded resolution and stages it, but `git merge` still
+  # exits non-zero and leaves the merge uncommitted. Nothing unmerged plus a
+  # live MERGE_HEAD means exactly that, so finish the commit rather than abort
+  # the merge rerere just fixed.
+  if [[ -z "${conflicts}" ]] && git -C "${WORKTREE}" rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    git -C "${WORKTREE}" commit --no-edit -q
+    echo "Merged ${label} (conflicts replayed from rerere)."
+    return 0
+  fi
+  {
+    echo "warning: ${label} does not merge cleanly; building WITHOUT it."
+    if [[ -n "${conflicts}" ]]; then
+      echo "         conflicting files:"
+      echo "           ${conflicts//$'\n'/$'\n'           }"
+      echo "         resolve once by hand and rerere will replay it next run:"
+      echo "           cd ${WORKTREE} && git merge ${ref}"
+    else
+      echo "         ${out//$'\n'/$'\n'         }"
+    fi
+  } >&2
   git -C "${WORKTREE}" merge --abort
-  echo "warning: PR head conflicts with current master; building the plain PR head instead." >&2
-fi
+  return 1
+}
 
-# Merged upstream? The merge below then adds nothing and can be dropped.
+try_merge origin/master "origin/master (${master_head:0:9})" || true
+
+# Ancestry only catches a plain merge upstream; a squash or rebase merge lands
+# the same code under a new SHA and still fails this test, so the merge below is
+# what actually decides.
 if git -C "${REPO}" merge-base --is-ancestor "${PR2_REF}" origin/master; then
   echo "PR #${PR2} has merged upstream; skipping its merge (remove it from this script)."
-elif git -C "${WORKTREE}" merge --no-edit "${PR2_REF}" >/dev/null 2>&1; then
-  echo "Merged PR #${PR2} (${pr2_head:0:9})."
+  pr2_state="upstream"
+elif try_merge "${PR2_REF}" "PR #${PR2} (${pr2_head:0:9})"; then
+  pr2_state="merged"
 else
-  git -C "${WORKTREE}" merge --abort
-  echo "warning: PR #${PR2} no longer merges cleanly; building without it." >&2
+  pr2_state="MISSING"
 fi
 
 # Use the same cmake preset as the main repo's build.sh (untracked file, so the
@@ -106,6 +147,12 @@ echo "Building llama-server, llama-cli, llama-bench (preset: local)..."
 cmake --build "${WORKTREE}/build" --target llama-server llama-cli llama-bench -j \
   || die "build failed"
 
-echo "${pr_head}+${master_head}+${pr2_head}" > "${MARKER}"
+echo "${marker_key} ${pr2_state}" > "${MARKER}"
 "${WORKTREE}/build/bin/llama-server" --version
+case "${pr2_state}" in
+  merged)   echo "PR #${PR2} (long-context perf): included." ;;
+  upstream) echo "PR #${PR2}: merged upstream, no longer carried separately." ;;
+  MISSING)  echo "warning: PR #${PR2} (long-context perf) is NOT in this build;" \
+                 "expect lower prefill at depth (see QWEN_NEXT.md)." >&2 ;;
+esac
 echo "Done. The router picks this up via LLAMA_SERVER_BIN in samm-mbp.env."
