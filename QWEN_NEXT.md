@@ -31,7 +31,7 @@ M5 Max 128GB, UD-IQ4_XS, C++ source-code prompts (prose lands a few t/s lower wi
 | ------------ | ------- | --------- | ------- |
 | short (n=200)| 41.6    | ~70       | +68%    |
 
-A UD-Q4_K_XL graft (`models/Qwen3.8-Flash-Next-MTP-Q4KXL-Merged-GGUF/`, q8_0 KV) measured 68.8 t/s short and 30.3 at 32K vs IQ4_XS's 70.1 / 34.1 (f16 KV) - parity short, ~11% slower at depth. Decode is bandwidth-bound, so the larger working set (~77 vs ~60GB) outweighs the faster Q4_K Metal kernels. It stays available as a quality option; IQ4_XS remains the speed default. Cold-cache warning: first load after a reboot fault-storms the SSD (single-digit t/s, OS lag) - warm it with a throwaway generation, and never benchmark two large quants alternately (page-cache churn hard-locked the machine once).
+A UD-Q4_K_XL graft (`models/Qwen3.8-Flash-Next-MTP-Q4KXL-Merged-GGUF/`, q8_0 KV) measured 68.8 t/s short and 30.3 at 32K vs IQ4_XS's 70.1 / 34.1 (f16 KV) - parity short, ~11% slower at depth. Decode is bandwidth-bound, so the larger working set (~77 vs ~60GB) outweighs the faster Q4_K Metal kernels. Caveat on that pair: the arms differ in KV type as well as model quant, so the depth gap is not cleanly attributable to the weights. f16 against q8_0 KV has never been A/B'd on this model - q8_0 was adopted to match the served config, not because it measured better - and with only 12 attention layers the KV is small enough that the Metal flash-attn in-kernel dequant could plausibly cost more at depth than the smaller cache saves. It stays available as a quality option; IQ4_XS remains the speed default. Cold-cache warning: first load after a reboot fault-storms the SSD (single-digit t/s, OS lag) - warm it with a throwaway generation, and never benchmark two large quants alternately (page-cache churn hard-locked the machine once).
 
 Total memory, measured at 32K context:
 
@@ -123,6 +123,7 @@ Every wired setting survives, so nothing in samm-mbp.ini changes. What the sweep
 - `spec-draft-p-min` is the highest-value knob on this model. Ungating costs 13% tg and halves acceptance (0.73 to 0.42): drafting while the model is unconfident is actively harmful, not merely neutral.
 - Acceptance is a trap metric. n-max 4 posts the best acceptance in the table and is not the fastest - shorter drafts are accepted more often per token while returning fewer tokens per verify batch. Rank configs by tg, never by acceptance.
 - `parallel 1` is neutral (+0.1%, inside noise) with acceptance unchanged. That is **not** a clean read on slot count: `n_parallel < 0` sets `n_parallel = 4` *and* `kv_unified = true`, so passing `--parallel 1` also drops to non-unified KV and changes per-slot context sizing. The arm compared "4 slots, unified" against "1 slot, non-unified", and the honest conclusion is only that the auto default is not costing anything - not that slot count specifically is free. Isolating it needs `--parallel 4 --kv-unified` against `--parallel 1 --kv-unified`. It also does not settle #27572, which is about acceptance collapse under *concurrent* requests; every request here ran alone.
+- **Every acceptance number in this document was taken with `cache_prompt=false`.** `bench-mtp.sh` posts it that way deliberately, for bit-identical runs. Production serves `cache_prompt=true`, and no script that sets it parses acceptance at all, so acceptance on the cached path has never been observed. The knob choices above are therefore tuned on the uncached shape and extrapolated to the served one. That extrapolation is untested rather than known-wrong, but it is the assumption to break first if the wired config ever looks worse in practice than it does here.
 
 ## Where the decode time actually goes (2026-09-02, measured)
 
@@ -218,6 +219,8 @@ Grouped by role rather than op: MoE ~32%, the GDN block and its projections (`z`
 
 **There is no dominant term.** Attention plus the QSA indexer is 5.4%, which independently confirms the dense-ablation null rather than contradicting it. The graph runs ~7000 nodes for 48 layers, ~145 per layer, and elementwise MUL/ADD/UNARY/SCALE together are 20.6% across 2562 calls - the largest fusion target, but still only a fifth.
 
+**Read that 20.6% as an upper bound, not a measurement.** `cb_eval` forces one node at a time, which disables Metal op fusion as well as serialising. The 152.6 us/call correction above removes the synchronisation cost but not the fusion effect, so a normal run already fuses some of those ops and the gain still on the table is smaller than 20.6% by an unknown amount. `GGML_METAL_FUSION_DISABLE` (`ggml/src/ggml-metal/ggml-metal-context.m:137`) makes this a one-run check against a normal build; it has not been done. The "no dominant term" conclusion does not depend on it - the expert-count ablation below reaches the same place independently.
+
 The practical consequence: nothing here yields a 2x. Removing the hyper-connection machinery entirely would take 48 s to 44 s. Effort is better spent not paying the cold prefill at all than making it faster.
 
 The profile did pay off once, though, by saying where to look. GDN at ~15% is the second-largest role, and PR #25788 fuses the recurrent-state snapshot write into the Metal `gated_delta_net` kernel instead of a per-layer `cpy` - **+3.5% decode at every depth from 4k to 32k, and +2.3% cold prefill**. Small, but it is the only change so far that helps both halves, and it is the size the profile predicts: a few percent, not a multiple.
@@ -242,11 +245,15 @@ That table is **not** our shape, and reading it as ours was a mistake. It is the
 
 | rows/expert source | IQ3_S | Q4_K | IQ4_NL | f16 |
 |---|---|---|---|---|
+| bs=1 | 1.68 | 2.26 | 2.23 | 0.93 |
+| bs=8 | 1.93 | 2.00 | 2.09 | 0.60 |
 | bs=512 | 9.75 | 9.99 | 9.34 | 3.92 |
 | **bs=2048 (our ubatch)** | **19.18** | 19.21 | 18.48 | 11.88 |
 | bs=4096 | 22.57 | 23.00 | 22.05 | 12.88 |
 
 At the ubatch we actually serve, the routed matmul runs at **19 TFLOPS**, not the 2.5-4.3 the wrong-shape table suggested, and IQ3_S is level with Q4_K. Expert-count matters enormously: 512 experts behave nothing like 128.
+
+The bs=1 and bs=8 rows are the **MTP verify-width** case, and they say the draft width buys nothing in this kernel: 1.68 to 1.93 TFLOPS across the whole range an MTP draft can occupy, against 19.18 at bs=2048. With 512 experts and 10 active, eight tokens almost never land on the same expert, so there are no weight reads to amortise and the expert matmul cost scales close to linearly with draft width. Amortisation only appears once each expert gets many rows, which needs a prefill-sized batch. This is the reason acceptance, not draft depth, is the lever on this model - a longer draft costs proportionally more to verify. It also means an end-to-end `llama-bench -p 1,2,4,8,16 -d <depth>` would be measuring CPU-side orchestration, since the kernel half of that question is now answered.
 
 Raising `ubatch` to buy rows per expert does not work, measured twice. At ubatch 4096 cold prefill drops to **634.9 tok/s from 702.6** - whatever the wider tile buys back is more than lost elsewhere.
 
@@ -328,7 +335,10 @@ Prefill deliberately breaks `4 + n_ubatch` and `4` tokens before the end so chec
 
 ## The client must send the thinking block back, or every turn re-prefills the answer (2026-09-02, measured)
 
-This is the one that matters for agent traffic, and it is a client-side property, not a server tuning knob.
+This is the one that matters for agent traffic. It is mostly a client-side property, but the earlier claim here that it is "not a server tuning knob" was wrong - there are two, and one of them is already on.
+
+- `--reasoning-format none` (`common/arg.cpp:3707`) leaves thoughts unparsed inside `content`, so even a content-only client round-trips the thinking block for free. It changes the API shape for every client on the router, and it has **not** been tested.
+- `--reasoning-preserve` (`common/arg.cpp:3761`) keeps the reasoning trace across the *whole* history rather than just the last assistant message, where the template supports it. It is wired on in `samm-mbp.ini`.
 
 This model thinks by default, so a reply arrives split across `reasoning_content` and `content`. A client that appends only `content` to the conversation sends back an assistant turn missing its thinking block. The slot's generated tokens then stop being a prefix of the next request, and because the recurrent half cannot be trimmed to an arbitrary position the server restores a context checkpoint and re-prefills the answer. Every turn.
 
@@ -344,6 +354,8 @@ The gap is the answer length, so it grows with how much the model writes - at 16
 `f_keep` in the server log is the diagnostic: **1.000 means the answer was kept**. Anything less means it is being re-prefilled, and nothing the API returns shows it. This is the same mechanism as [#28049](https://github.com/ggml-org/llama.cpp/issues/28049) reached by a different route - there the tail tokens come from `draft-mtp` leaving accepted tokens past the EOG, here from the client dropping the thinking block.
 
 Unresolved: whether the server's `--reasoning-preserve` matters once the client does echo. Three turns gave 469 ms with it against 802 ms without, `f_keep` 1.000 in both, with per-turn counts too variable (387/861/23) to call. Needs more turns before anything is changed in the ini.
+
+Also unpriced: echoing the thinking block keeps `f_keep` at 1.000, but it appends up to `reasoning-budget` (8192, wired in `samm-mbp.ini`) tokens of reasoning per turn to the history, and every later prefill and decode carries them. That cost has never been measured against the alternative of re-prefilling the answer. Both sides of the trade need a number before the current setting can be called optimal rather than merely better on the one metric that was checked.
 
 **Action:** check what the router actually sends. If it forwards only `content`, fixing that is worth more than anything else measured in this document.
 
@@ -376,7 +388,9 @@ Worth knowing before anyone optimises for the name on the tin. Actual tensor-typ
 
 "UD-IQ4_XS" is Unsloth's naming convention, not a description of the weights. Per-token expert traffic is IQ3_S 662 MB, IQ4_NL 396 MB, IQ4_XS 17 MB - so doubling IQ4_XS kernel speed would buy roughly 1.5% of decode.
 
-IQ3_S is both the largest share of expert traffic and the slowest Metal kernel, and it does not scale with batch: `test-backend-ops perf -o MUL_MAT` at m=4096,k=14336 gives 2.38 / 2.44 / 2.56 / 2.55 TFLOPS at n=2/3/4/5, where IQ4_NL climbs 2.64 to 4.09 and Q4_K holds ~3.5. It also has the `ix = tiisg` idle-lane pattern that PR #28086 fixed for IQ3_XXS (`ggml/src/ggml-metal/kernels/mul_mv.metal:2249`), and at `ne00=2560` the guard `32 % nb32 == 0` does not fire, so a generalised `ntx = gcd(32, nb32)` split is still available. The `N_R0` half of that PR measured null here, so the split half would need measuring on its own before assuming it helps. Note `test-backend-ops` has no IQ3_S/IQ4_NL coverage for MUL_MAT_ID, so the MoE path cannot be micro-benchmarked without adding cases.
+IQ3_S is the largest share of expert traffic. It is also the slowest kernel *in the dense matvec shape*: `test-backend-ops perf -o MUL_MAT` at m=4096,k=14336 gives 2.38 / 2.44 / 2.56 / 2.55 TFLOPS at n=2/3/4/5, where IQ4_NL climbs 2.64 to 4.09 and Q4_K holds ~3.5. Treat that as background only - it is `MUL_MAT` at a shape this model does not run, which is the exact reading error corrected above. At the real MoE geometry IQ3_S is level with Q4_K and IQ4_NL from bs=8 upwards, which covers prefill and most of the MTP verify batch. It is ~25% behind them at bs=1 (1.68 against 2.26 and 2.23), and bs=1 is the single-token decode step, so a small IQ3_S-specific gap does exist in the narrowest decode case. It closes by bs=8 and is worth at most a few percent of decode, which is why the kernel work below is still not worth chasing - but the flat "IQ3_S is fine everywhere" reading is too strong.
+
+IQ3_S also has the `ix = tiisg` idle-lane pattern that PR #28086 fixed for IQ3_XXS (`ggml/src/ggml-metal/kernels/mul_mv.metal:2249`), and at `ne00=2560` the guard `32 % nb32 == 0` does not fire, so a generalised `ntx = gcd(32, nb32)` split is still available. The `N_R0` half of that PR measured null here, so the split half would need measuring on its own before assuming it helps. (An earlier version of this line said `test-backend-ops` has no IQ3_S/IQ4_NL coverage for `MUL_MAT_ID` and that the MoE path could not be micro-benchmarked without adding cases. The cases were added and run - see the 512-expert table above.)
 
 ## Context depth does not shift the draft/verify split (2026-09-02, measured)
 
