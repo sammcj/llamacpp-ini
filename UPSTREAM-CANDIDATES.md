@@ -76,6 +76,28 @@ The `f_keep` 0.974 gap in append-only traffic at 160-token answers was never cha
 
 ---
 
+## Metal `mul_mv_ext` batch bound caps speculative decoding at width 8 - INVESTIGATE
+
+Not a proposed patch yet: the cliff is measured, the fix is not.
+
+`ggml/src/ggml-metal/ggml-metal-ops.cpp:2494` in `ggml_metal_op_mul_mat` gates the `mul_mv_ext` fast path to `ne11 >= 2 && ne11 <= 8` for block-32 types, and `ne11 >= 4 && ne11 <= 8` for K-quants. At `ne11 = 9` the dense projections and the LM head drop onto the generic kernel.
+
+Measured on Qwen3.8-Flash-Next, f16 KV, depth 8192, r=8, ms per batch:
+
+| n | 7 | 8 | 9 | 10 | 16 |
+|---|---|---|---|---|---|
+| ms | 58.07 | 61.11 | **139.71** | 142.49 | 161.63 |
+
+A +78 ms step at exactly the bound. It is a step in fixed cost, not a change in scaling: the local marginal cost per token is 3.04 ms just below the bound (58.07 to 61.11) and 3.1 ms above it (10 to 16). Both kernels scale the same way; the generic one simply starts ~78 ms higher.
+
+Why this matters beyond this model: every speculative decoder on Metal submits a verify batch of `n_draft + 1`. The bound therefore caps useful draft width at 7 on any model and any backend-sampling scheme, and it does so invisibly - it presents as "longer drafts measure worse", which reads like an acceptance problem. On this model it is the entire reason `n-max 6` benchmarks as optimal and `n-max 8` costs 14%. That optimum is a kernel artefact.
+
+What would need doing before this is a PR:
+
+- Establish why the bound is 8. The surrounding code carries a `TODO: determine the optimal parameters based on grid utilization` and an explicit "I still don't know why we should not always use the maximum available threads", so 8 may be tuning inherited rather than a hardware limit.
+- Measure `mul_mv_ext` with the bound raised to 16 and 32, for correctness first and then speed. If it degrades above 8 for a real reason, the fix is instead a mid-range path for 9-32 rather than widening this one.
+- Check the K-quant lower bound of 4 while there. Nothing here explains why K-quants need `ne11 >= 4` when block-32 types manage from 2.
+
 ## Related upstream work, not ours
 
 - **[#28049](https://github.com/ggml-org/llama.cpp/issues/28049)** (open issue, no PR as of 2026-09-02) - `draft-mtp` leaves accepted tokens past the EOG token in the slot, so the slot stops being a prefix and a hybrid model re-prefills the whole previous answer. The author proposes a 7-line fix cutting `accepted` at the first EOG before `n_rollback` is computed. Applied and measured here as no change - but that test **could not have detected anything**, for three reasons: with thinking on and a 160-token cap the generation never reaches EOG so the loop never fires; the harness was echoing an empty assistant turn, so answer reuse could not happen either way; and the issue's repro ran `enable_thinking:false`, the opposite configuration. Treat the null as void, not as evidence against the fix. Superseded by #28232 below, which is the same fix as a real PR and is now in the build. Note also that #28049's body cites `checkpoint_offsets` directly and explains the `+4` as this same mechanism, so it is not an unrelated hit.
@@ -88,8 +110,10 @@ The `f_keep` 0.974 gap in append-only traffic at 160-token answers was never cha
 
 Cold prefill measured 707.4 tok/s with it against 682.3 without, back to back. Single sample each, ordering uncontrolled, on a machine that had been running the model for an hour - enough to rule out a large cost, not enough to call it free. About 900 MiB per ~33k prompt, capped at 32 GiB.
 
-Set **per model** by `sync-models.py`, not in the launcher. The router builds each child's args from its own argv (`server_models` constructs `base_preset` from `argc/argv`, and `--cache-disk` is not in `unset_reserved_args`), so a single path given to the router reaches every child - and a child deletes every entry in its directory whose cache key is not its own. One shared path means loading a second model wipes the first model's cache.
-  - Needs two local fixes. It conflicts with #28022 in `server-context.cpp`, resolved here by keeping #28092's disk/RAM split, #28022's short-write checks on the RAM branch (using #28092's `discard()`), and #28022's sleep-preserve guard around the cache rebuild; rerere replays it. And it does not compile on macOS: `key << modified.time_since_epoch().count()` is ambiguous because libc++'s `file_clock` has an `__int128` rep, fixed with a `(long long)` cast. Worth reporting on the PR.
+Set **per model** by `sync-models.py`, not in the launcher. The router builds each child's args from its own argv (`server_models` constructs `base_preset` from `argc/argv`, and `--cache-disk` is not in `unset_reserved_args`), so a single path given to the router reaches every child - and a child deletes every entry in its directory whose cache key is not its own. One shared path means loading a second model wipes the first model's cache. Confirmed in source: on startup `server_prompt_cache_read_metadata` returns false when the stored key is not the server's own, and the caller responds with `server_prompt_cache_remove_files` (`tools/server/server-task.cpp`, the restore loop).
+
+Restricted to Qwen 3.8 models 2026-09-03 (`cache_disk_models` in `sync-models.py`, matched as a case-insensitive substring so the `mtp-` and `-no-mmproj` variants come along). The cap is **per model**, so enabling it for all 17 put ~544 GiB of potential disk use behind a feature only the big slow models benefit from - a small model reloads faster than its cache restores. Now 7 models, ~224 GiB worst case. Note `--cache-disk` exists **only** in #28092 and is not in upstream master, so if that PR is ever dropped from `EXTRA_PRS` these ini keys become dead config that a stock binary rejects.
+  - Needs two local fixes. It conflicts with #28022 in `server-context.cpp`, resolved here by keeping #28092's disk/RAM split, #28022's short-write checks on the RAM branch (using #28092's `discard()`), and #28022's sleep-preserve guard around the cache rebuild; rerere replays it. And it does not compile on macOS: `key << modified.time_since_epoch().count()` is ambiguous because libc++'s `file_clock` has an `__int128` rep, fixed with a `(long long)` cast. **Both reported upstream 2026-09-03**: [comment on #28092](https://github.com/ggml-org/llama.cpp/pull/28092#issuecomment-5517314832) with the macOS numbers and the shared-directory note, and the cast submitted as a PR into the author's own branch, [yitizi/llama.cpp#1](https://github.com/yitizi/llama.cpp/pull/1) (base `pr2-standalone`). If that is merged, drop the cast half of `patches/0001-server-context-local.patch`.
 - **[#25788](https://github.com/ggml-org/llama.cpp/pull/25788)** (open) - Metal `gated_delta_net` cache fusion, mirroring the CUDA path: the kernel writes recurrent-state snapshots straight into the KV cache rather than doing a per-layer `cpy`. 36 of our 48 trunk layers are GDN, and it is the first thing tried here that helps both halves. `llama-bench -p 0 -n 32`, against the same baseline as #28213:
 
 | depth | baseline | #25788 | |

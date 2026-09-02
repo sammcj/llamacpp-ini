@@ -25,7 +25,7 @@ That is worth stating because [unsloth/llama.cpp#142](https://github.com/unsloth
 
 ## Benchmarks
 
-M5 Max 128GB, UD-IQ4_XS, C++ source-code prompts (prose lands a few t/s lower with the same ordering). Current config on the preset (LTO) build. Benchmark convention from 2026-08-30 on: always pass `-ctk q8_0 -ctv q8_0` to match the served config (the router's global `cache-type-k/v = q8_0`); numbers before that date used f16 KV. Target-KV q8_0 is safe on this arch - the crash reports concern the draft KV quant only.
+M5 Max 128GB, UD-IQ4_XS, C++ source-code prompts (prose lands a few t/s lower with the same ordering). Current config on the preset (LTO) build. Benchmark convention, 2026-08-30 to 2026-09-02: always pass `-ctk q8_0 -ctv q8_0` to match the served config (the router's global `cache-type-k/v = q8_0`). **Superseded 2026-09-02: this model is now served f16 KV (see the KV section below), so benchmark it with `-ctk f16 -ctv f16`. The global stays q8_0, so the q8_0 convention still holds for every other model.** Numbers before that date used f16 KV. Target-KV q8_0 is safe on this arch - the crash reports concern the draft KV quant only.
 
 | context      | no spec | draft-mtp | speedup |
 | ------------ | ------- | --------- | ------- |
@@ -123,7 +123,9 @@ Every wired setting survives, so nothing in samm-mbp.ini changes. What the sweep
 - `spec-draft-p-min` is the highest-value knob on this model. Ungating costs 13% tg and halves acceptance (0.73 to 0.42): drafting while the model is unconfident is actively harmful, not merely neutral.
 - Acceptance is a trap metric. n-max 4 posts the best acceptance in the table and is not the fastest - shorter drafts are accepted more often per token while returning fewer tokens per verify batch. Rank configs by tg, never by acceptance.
 - `parallel 1` is neutral (+0.1%, inside noise) with acceptance unchanged. That is **not** a clean read on slot count: `n_parallel < 0` sets `n_parallel = 4` *and* `kv_unified = true`, so passing `--parallel 1` also drops to non-unified KV and changes per-slot context sizing. The arm compared "4 slots, unified" against "1 slot, non-unified", and the honest conclusion is only that the auto default is not costing anything - not that slot count specifically is free. Isolating it needs `--parallel 4 --kv-unified` against `--parallel 1 --kv-unified`. It also does not settle #27572, which is about acceptance collapse under *concurrent* requests; every request here ran alone.
-- **Every acceptance number in this document was taken with `cache_prompt=false`.** `bench-mtp.sh` posts it that way deliberately, for bit-identical runs. Production serves `cache_prompt=true`, and no script that sets it parses acceptance at all, so acceptance on the cached path has never been observed. The knob choices above are therefore tuned on the uncached shape and extrapolated to the served one. That extrapolation is untested rather than known-wrong, but it is the assumption to break first if the wired config ever looks worse in practice than it does here.
+- **Every acceptance number in this document was taken with `cache_prompt=false`.** `bench-mtp.sh` posts it that way deliberately, for bit-identical runs. Production serves `cache_prompt=true`, and no script that sets it parses acceptance at all, so acceptance on the cached path has never been observed. The knob choices above are therefore tuned on the uncached shape and extrapolated to the served one. That extrapolation is untested rather than known-wrong, but it is the assumption to break first if the wired config ever looks worse in practice than it does here. **Now tested and it holds - see the cached-path section below.**
+- **`--backend-sampling` and `--spec-draft-backend-sampling` are different flags, and only one of them is on.** `-bs, --backend-sampling` (`common/arg.cpp:2320`, "experimental", default off) is a target-side sampling option; `--spec-draft-backend-sampling` (4228) is the draft-side one, and it is the one wired in `samm-mbp.ini` and in every bench script here. The target-side flag has never been passed. Expected gain is small, but it is untested rather than rejected, and the two names are close enough that an audit already conflated them once.
+- **Threads need no sweep, now measured rather than assumed.** This M5 Max is 6 P-cores and 12 E-cores (`hw.perflevel0.physicalcpu` 6, `perflevel1` 12, 18 physical). `common/common.cpp:108` reads `perflevel0` for the default, and every server and `llama-bench` run here logs `n_threads = 6`, so llama.cpp is already pinned exactly to the P-cores with no E-core stragglers to shed. The commented-out `; threads = 16` in `samm-mbp.ini` would be worse, not better.
 
 ## Where the decode time actually goes (2026-09-02, measured)
 
@@ -188,6 +190,8 @@ The 3.2 s wall against 0.1 s of prefill is the weight reload, which the timings 
 A restart is the other way the cache dies, and #28022 does nothing for it - the fourth step of the same test measures a full 39.7 s. **PR #28092** (`--cache-disk`) writes the state under a directory and reloads it on start, taking that to 0.09 s prefill, with the restore costing nothing at startup either (6.0 s to first listen on the restart against 9.0 s cold). About 900 MiB of disk per ~33k prompt, capped at 32 GiB.
 
 It is set per model by `sync-models.py`, not by the launcher: the router builds each child's arguments from its own argv, and a child deletes every entry in its cache directory whose key is not its own, so one shared path would mean each model wiping the last one's cache.
+
+Restricted to Qwen 3.8 models on 2026-09-03 (`cache_disk_models` in `sync-models.py`). The 32 GiB cap is per model, so having it on for all 17 meant ~544 GiB of potential disk use for a feature only the big slow models benefit from; it is now 7 models and ~224 GiB. The Flash-Next model's own keys are written by hand in `samm-mbp.ini` rather than generated, because `sync-models.py` only reaches models it finds by scanning the source tree and the merged GGUF lives outside it - that is why this model silently had no disk cache at all until 2026-09-03, despite the measurement above having been taken on it.
 
 Both flags are probed against `--help` before being passed, since neither PR is upstream yet and an unknown flag is fatal on the stock binary the MBA uses.
 
@@ -255,11 +259,118 @@ At the ubatch we actually serve, the routed matmul runs at **19 TFLOPS**, not th
 
 The bs=1 and bs=8 rows are the **MTP verify-width** case, and they say the draft width buys nothing in this kernel: 1.68 to 1.93 TFLOPS across the whole range an MTP draft can occupy, against 19.18 at bs=2048. With 512 experts and 10 active, eight tokens almost never land on the same expert, so there are no weight reads to amortise and the expert matmul cost scales close to linearly with draft width. Amortisation only appears once each expert gets many rows, which needs a prefill-sized batch. This is the reason acceptance, not draft depth, is the lever on this model - a longer draft costs proportionally more to verify. It also means an end-to-end `llama-bench -p 1,2,4,8,16 -d <depth>` would be measuring CPU-side orchestration, since the kernel half of that question is now answered.
 
+**Those TFLOPS are cache-hot, and neither of them anchors "bandwidth-bound".** Same op, same shape, bs=1: f16 moves 32.8 MB in ~35 us, implying ~930 GB/s, while IQ3_S moves ~7.2 MB in ~20 us for ~370 GB/s. Two arms of one benchmark cannot both describe the machine's streaming rate, and the f16 figure is above anything this chip plausibly sustains, so a 32.8 MB working set is being served from the system-level cache across repetitions. Two consequences. IQ3_S at bs=1 is *not* near bandwidth - it is sitting on a floor that is dequant compute or per-launch overhead, which is why it reads 4.5x fewer bytes than f16 yet runs only 1.8x faster. And any expert-share estimate derived from 1.68 TFLOPS is a lower bound, so the end-to-end sweep is still worth running rather than being replaced by this arithmetic. A real bandwidth number needs a weight set larger than the SLC.
+
 Raising `ubatch` to buy rows per expert does not work, measured twice. At ubatch 4096 cold prefill drops to **634.9 tok/s from 702.6** - whatever the wider tile buys back is more than lost elsewhere.
 
 So there is no quant-kernel lever and no MoE-occupancy lever. Both were hypotheses built by reading a benchmark taken at the wrong shape, which is the same failure mode as the three cost models before them. The per-op profile above is what should be trusted instead.
 
 `MUL_MAT_ID` had no `test-backend-ops` coverage for IQ3_S or IQ4_NL, nor for any 512-expert geometry. Cases for both were added (`tests/test-backend-ops.cpp`, the qwen3.8-flash-next block); note `ffn_down_exps` has k=640, which is not a multiple of QK_K, so only block-32 types are legal for that half - which is exactly why that tensor is IQ4_NL in the GGUF and not a K-quant.
+
+## T(n): what a verify batch actually costs (2026-09-02, measured)
+
+`bench-batch-scaling.sh`. Every decode figure above this line came from `-p 0 -n 32`, which is single-token decode. MTP verifies a whole draft in one batch, so the quantity that sets its economics is T(n), the cost of verifying n tokens at once, and nobody had it. Note llama-bench runs no MTP head: this is **trunk verify cost only**, and a draft-step cost must not be added to it.
+
+Depth 8192, `-ub 2048 -b 2048`, r=5, converted from llama-bench's tok/s to ms per batch:
+
+| n | q8_0 KV | f16 KV |
+|---|---|---|
+| 1 | 25.97 | 25.62 |
+| 2 | 32.36 | 32.57 |
+| 4 | 45.19 | 44.38 |
+| 8 | 63.18 | 61.40 |
+| 16 (excluded from fit) | 166.1 | 161.6 |
+
+Least squares over n=1..8 only: **q8_0 `T(n) = 21.9 + 5.28n` ms, f16 `T(n) = 22.1 + 5.03n` ms.** n=16 sits ~60 ms above the fit line and is excluded - it is past the cliff described below, and including it would fit a line through two different regimes.
+
+- **The intercept is ~84% of a single-token step.** 22 ms is fixed per forward pass and 5.3 ms is per token in the batch. That is the split the three failed cost models were missing.
+- **The slope bounds the expert term, and the bound is 1.9x the kernel estimate.** `MUL_MAT_ID` at 1.68 TFLOPS predicts 2.8 ms/token for experts; the measured slope is 5.28. The slope is not purely experts - swapping the KV type alone moves it by 0.25 ms/token, so per-token attention is in there too - which puts the expert term somewhere between 2.8 and 5.28 ms/token, or 11-20% of a single-token step rather than the 9% the kernel arithmetic gave. The isolated kernel benchmark is cache-hot (see above), so it was always going to read low.
+- **This sets a ceiling on what MTP can buy, and the served gain is well under it.** At the measured mean accepted length of 3.52 (see the acceptance section above), a verify batch of ~4.45 costs `22.1 + 5.03 x 4.45 = 44.5` ms for 3.52 tokens, or 12.6 ms/token against 25.62 ms sequential - a **2.0x** ceiling. Observed end-to-end is lower than that (49.58 t/s served against 42.98 t/s single-token decode at 4K is 1.15x; the doc's headline 70 vs 41.6 t/s short-context figure is 1.68x). The gap between 2.0x and what is actually served is **unaccounted for** - llama-bench runs no MTP head and a different sampler, so these are not like-for-like, and the ~8% draft-step cost does not close it either. Do not quote 2.0x as a delivered speedup. What the shape does establish is that the gain comes from spreading one 22 ms fixed cost over several tokens, which is why acceptance and not draft depth is the lever.
+- **There is a hard cliff between batch 8 and batch 9, and it is a Metal kernel bound.** Pinned at r=8, f16 KV, depth 8192:
+
+| n | 7 | 8 | 9 | 10 | 12 | 14 | 16 |
+|---|---|---|---|---|---|---|---|
+| ms | 58.07 | 61.11 | **139.71** | 142.49 | 149.31 | 154.76 | 161.63 |
+
+  A +78 ms step at n=9, not a change of slope. The local marginal cost per token is the same either side (3.04 ms from 8 to 9's neighbours below, 3.1 ms from 10 to 16); only the fixed cost jumps.
+
+  **Likely cause, code read correlated with the step rather than proven by ablation.** `ggml/src/ggml-metal/ggml-metal-ops.cpp:2494`, inside `ggml_metal_op_mul_mat`, gates the `mul_mv_ext` fast path to `ne11 >= 2 && ne11 <= 8` for block-32 types and `ne11 >= 4 && ne11 <= 8` for K-quants. The bound coincides exactly with the step. This model's attention projections are Q8_0, which is on the block-32 list, so they use that path and fall off it at batch 9. Note the experts do *not* explain it: IQ3_S is on neither list, and the expert tensors route through `MUL_MAT_ID` rather than this function at all. So the step is dense `MUL_MAT`, not MoE.
+
+  The test that would settle it - raise the bound to 16, rebuild, re-run n=9 - has not been done. See UPSTREAM-CANDIDATES.md.
+
+- **`n-max 7` tested off the back of this and rejected (2026-09-02).** 7 is the largest draft whose verify batch (8) stays under the bound, and it had never been tried - 6 was chosen before the bound was known. `bench-decode.sh`, 3 prompts, ABBA, both repeats identical to five decimals:
+
+| arm | tg t/s | acceptance | mean accepted len |
+|---|---|---|---|
+| n-max 6 | **60.5** | 0.739 | 3.61 |
+| n-max 7 | 60.2 | 0.703 | 3.73 |
+
+  0.5% slower. Longer drafts do return more tokens per verify pass (3.73 against 3.61), and the wider batch costs more than that buys. `n-max 6` stays.
+
+  **The T(n) fit gets the sign right and over-predicts the size.** It says batch 8 against batch 7 should cost `(22.1+5.03x8)/3.73` against `(22.1+5.03x7)/3.61`, or -4.9%; measured is -0.5%. The likely reason is that `p-min 0.7` truncates most drafts well short of `n-max`, so the effective verify batch is similar in both arms rather than 7 against 8. That is the same over-prediction as the 2.0x MTP ceiling against a 1.15x observation, and it points the same way: **T(n) is a ceiling, and `p-min` gating keeps the served workload well below it.** Anything derived from T(n) alone should be treated as an upper bound until measured end to end.
+
+  Two consequences. It retro-explains "n-max 8 still costs 14%" in the sweep above: a draft of 8 submits a verify batch of 9, one over the bound, so that row was never an acceptance effect. And it puts a hard ceiling on MTP draft width at 7 on Metal regardless of how good acceptance gets, which is why `n-max 6` (batch 7) measures as the optimum and nothing above it can. That optimum is a kernel artefact, not a property of the model.
+
+Caveat: pp1's error bar is +/-11% (38.50 +/- 4.31 t/s), so the intercept is the least certain term in the fit.
+
+## Acceptance on the cached path: no penalty (2026-09-02, measured)
+
+The open question above - every acceptance figure taken at `cache_prompt=false` while production serves `cache_prompt=true` - is answered for the case that matters, with a caveat on a second case. `verify-cached-acceptance.sh`: one server, one fixed history, cached and uncached requests sending byte-identical messages with the same seed, `ignore_eos` so both generate exactly 1024 tokens, arm order alternating by rep parity, and a sha of each generation so content identity is *observed* rather than assumed.
+
+| rep | order | cached prefill | cached sha | uncached sha | cached acc | uncached acc |
+|---|---|---|---|---|---|---|
+| 1 | cached first | 42 tok | `1f7a053b` | `7eaee009` | 0.70180 | 0.68345 |
+| 2 | uncached first | 4 tok | `7eaee009` | `7eaee009` | **0.68841** | **0.68841** |
+| 3 | cached first | 42 tok | `1f7a053b` | `7eaee009` | 0.70215 | 0.68345 |
+| 4 | uncached first | 4 tok | `7eaee009` | `7eaee009` | **0.68841** | **0.68841** |
+
+Two different paths are being exercised, and the parity split is what separates them:
+
+- **Exact slot continuation (reps 2 and 4).** The preceding uncached request left the slot warm, so only 4 tokens needed prefilling. Output is byte-identical to the uncached arm and acceptance matches to five decimals, 0.68841 both ways, tg 49.14 against 49.11. This path is numerically exact and costs nothing. It is also the common case in agent traffic, where each turn appends to the slot the last turn left.
+- **Checkpoint replay (reps 1 and 3).** Restoring from the prime request's checkpoint replays 42 tokens, and the generated text diverges from the uncached arm. Acceptance is not worse - 0.702 against 0.683, slightly ahead - but with different content behind the two numbers that is suggestive, not established.
+
+Rerunning the whole thing at `TEMP=0` separates the two explanations for that divergence, and the answer is the less comfortable one. Under greedy sampling the replay arm **still** produces different text (`18eaf989` against `bd651db5`, identically on both reps), and at temp 0 divergence requires an actual argmax flip rather than a nudged logit losing a coin-toss. **The checkpoint restore is therefore not bit-exact.**
+
+Greedy numbers, same harness:
+
+| path | output | acceptance | tg t/s |
+|---|---|---|---|
+| exact continuation (4 tok prefill) | identical | 0.72443 vs 0.72096 | 51.60 vs 51.45 |
+| checkpoint replay (42 tok prefill) | **differs** | 0.71480 vs 0.72096 | 50.97 vs 51.57 |
+| overall (4 reps) | | -0.0013 | -0.20 |
+
+Two things follow.
+
+- **For tuning, it does not matter.** The replay path costs 0.9% acceptance and 1.2% tg, the continuation path is fractionally ahead, and the overall delta is -0.13% acceptance and -0.4% tg. The `n-max` and `p-min` choices tuned on the uncached shape transfer to the served one. That question is closed.
+- **For reproducibility, it does.** A cached turn that lands on a checkpoint replay can produce different output from the same request served cold, deterministically and even at temp 0. Anything comparing generations across runs must hold the cache path constant or it is comparing two different texts - which is exactly how the first two attempts at this measurement went wrong.
+
+One further detail worth keeping: on reps 2 and 4 the output hashes match while acceptance still differs slightly (0.72443 against 0.72096). Identical output does not imply identical drafts - the target's argmax lands in the same place while the MTP head proposes marginally different tokens. Acceptance is the more sensitive instrument of the two, so a null on generated text is not a null on draft behaviour.
+
+`create_checkpoint` does carry `update_dft(ctx_dft, ...)` and `common_speculative_get_state(...)` alongside the target state (`server-context.cpp`), so draft state is not simply being dropped. Both saves pass `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`, which on a GDN recurrent model is the obvious place to look for why the restore is inexact - untested.
+
+**Method note, because getting this wrong wasted a round.** Running `sweep-chat.sh` twice, once per cache setting, does *not* answer this and no number of turns fixes it. Two confounds:
+
+- The arms generate different text from turn 2 onwards, and acceptance on this model tracks content strongly (tool-call JSON drafts far better than prose). By turn 5 the arms are answering different questions.
+- The uncached arm re-prefills every turn - 11173 ms mean against 292 ms - so it does roughly 10x the GPU work and runs hotter, and generations stopping at EOG rather than `max_tokens` leave the two arms at different context depths anyway.
+
+Measured that way, 4 turns said cached was 7% worse on acceptance and 9% worse on tg; 10 turns said cached was *better* on both (0.7277 vs 0.7150, 49.25 vs 47.91). Neither was measuring the cache. Use `verify-cached-acceptance.sh` for this question and `sweep-chat.sh` only for per-turn prefill cost, which it does measure correctly.
+
+The per-turn prefill figure from that same run is worth keeping: a steady-state cached agent turn costs **292 ms against 11173 ms uncached**, holding out to turn 11 at ~16k context.
+
+## KV cache type: f16 beats q8_0, adopt it (2026-09-02, measured)
+
+Never A/B'd before - `-ctk q8_0 -ctv q8_0` was adopted on 2026-08-30 as a convention to match the served config, not because it measured faster. It is slower.
+
+| depth | q8_0 | f16 | f16 gain |
+|---|---|---|---|
+| 4096 | 42.29 +/- 0.12 | 42.98 +/- 0.20 | +1.6% |
+| 32768 | 34.48 +/- 0.31 | 35.07 +/- 0.06 | +1.7% |
+
+Consistent direction at both depths with non-overlapping error bars, from separate runs. That is the whole case, and it is enough.
+
+No mechanism is claimed. The T(n) fits differ by 0.25 ms/token in slope (5.03 f16 vs 5.28 q8_0), which is tempting to read as flash-attn no longer dequantising KV per token - but that difference is smaller than the +/-11% error bar on the n=1 point inside the same fit, and at n=2 the sign reverses (32.36 q8_0 against 32.57 f16). Establishing the mechanism needs arms 1 and 3 re-run at higher `-r` with per-point error bars.
+
+Only 12 of 48 layers attend, so the memory cost is small. For scale this is a larger win than #28213 (rejected) and roughly half of #25788 (adopted), for a config change rather than a patch.
 
 ## Q4_0 draft LM head: rejected on multi-prompt retest (2026-09-02)
 

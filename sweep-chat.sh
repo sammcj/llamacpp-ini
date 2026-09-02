@@ -26,6 +26,19 @@ PORT="${PORT:-8961}"
 NGEN="${NGEN:-160}"
 TURNS="${TURNS:-5}"
 
+# Every acceptance figure in QWEN_NEXT.md was taken with cache_prompt=false, because
+# bench-mtp.sh posts it that way to get bit-identical runs. Production serves
+# cache_prompt=true, and until now no script that set it parsed acceptance at all - so
+# the n-max and p-min choices are tuned on a path the server never actually runs.
+#
+# CACHE=false runs the same turns uncached, but it is NOT a control arm and this script
+# cannot answer the acceptance question: each arm generates its own conversation, so from
+# turn 2 they are answering different text, and acceptance here tracks content strongly.
+# Measured that way 4 turns and 10 turns gave opposite signs. Use
+# verify-cached-acceptance.sh for that. What this script measures correctly is per-turn
+# prefill cost, where the arms are directly comparable.
+CACHE="${CACHE:-true}"
+
 BASE="$(cat "${PROMPT_FILE:-/private/tmp/claude-501/pp-prompt.txt}")"
 
 # NO_RP=1 drops --reasoning-preserve, to separate the server-side half of the
@@ -57,17 +70,22 @@ until grep -q 'listening on' "${LOG}" 2>/dev/null; do
 done
 
 {
-  echo "chat-history multi-turn $(date '+%Y-%m-%d %H:%M')  bin=${BIN}"
-  printf '%-8s %10s %12s %10s\n' turn prompt_n prompt_ms f_keep
+  echo "chat-history multi-turn $(date '+%Y-%m-%d %H:%M')  bin=${BIN}  cache_prompt=${CACHE}"
+  printf '%-8s %10s %12s %10s %10s %10s\n' turn prompt_n prompt_ms f_keep accept tg_t/s
 } | tee "${OUT}"
 
 msgs="$(jq -n --arg p "${BASE}" '[{role:"user",content:$p}]')"
 
 for ((t = 1; t <= TURNS; t++)); do
+  # Mark the log before the request so acceptance is read from THIS turn's stats block
+  # rather than whatever the previous turn left behind - a failed turn would otherwise
+  # silently repeat the last good number.
+  mark="$(wc -l < "${LOG}")"
+
   r="$(curl -sS -m 1800 "http://127.0.0.1:${PORT}/v1/chat/completions" \
         -H 'Content-Type: application/json' \
-        -d "$(jq -n --argjson m "${msgs}" --argjson n "${NGEN}" \
-              '{messages:$m,max_tokens:$n,seed:1234,cache_prompt:true}')")"
+        -d "$(jq -n --argjson m "${msgs}" --argjson n "${NGEN}" --argjson c "${CACHE}" \
+              '{messages:$m,max_tokens:$n,seed:1234,cache_prompt:$c}')")"
 
   # This model thinks by default, so the answer arrives split across
   # reasoning_content and content. Reading only content sends an EMPTY assistant
@@ -76,12 +94,16 @@ for ((t = 1; t <= TURNS; t++)); do
   # harness bug. Echo both back, as a client with reasoning preserved would.
   reply="$(jq -r '.choices[0].message.content // ""' <<< "${r}")"
   reason="$(jq -r '.choices[0].message.reasoning_content // ""' <<< "${r}")"
-  fk="$(grep -oE 'f_keep = [0-9.]+' "${LOG}" | tail -1 | grep -oE '[0-9.]+$' || echo '-')"
+  new="$(tail -n +$((mark + 1)) "${LOG}")"
+  fk="$(grep -oE 'f_keep = [0-9.]+' <<< "${new}" | tail -1 | grep -oE '[0-9.]+$' || echo '-')"
+  acc="$(grep -oE 'draft acceptance = [0-9.]+' <<< "${new}" | tail -1 | grep -oE '[0-9.]+$' || echo '-')"
 
-  printf '%-8s %10s %12s %10s\n' "${t}" \
+  printf '%-8s %10s %12s %10s %10s %10s\n' "${t}" \
     "$(jq -r '.timings.prompt_n // "?"' <<< "${r}")" \
     "$(jq -r '.timings.prompt_ms // "?" | if type=="number" then (.*10|round/10) else . end' <<< "${r}")" \
-    "${fk}" | tee -a "${OUT}"
+    "${fk}" "${acc}" \
+    "$(jq -r '.timings.predicted_per_second // "?" | if type=="number" then (.*100|round/100) else . end' <<< "${r}")" \
+    | tee -a "${OUT}"
 
   # append the assistant turn and a new user turn, exactly as a chat client would
   msgs="$(jq -n --argjson m "${msgs}" --arg a "${reply}" --arg rc "${reason}" \
@@ -94,7 +116,15 @@ kill "${SRV}" 2>/dev/null || true
 wait "${SRV}" 2>/dev/null || true
 SRV=""
 
-awk 'NR>2 && $1 ~ /^[0-9]+$/ && $1 > 1 {s+=$3; n++} END {if (n) printf "steady-state mean prompt_ms over %d turns: %.1f\n", n, s/n}' \
-  "${OUT}" | tee -a "${OUT}"
+awk 'NR>2 && $1 ~ /^[0-9]+$/ && $1 > 1 {
+       s += $3; n++
+       if ($5 ~ /^[0-9.]+$/) { a += $5; an++ }
+       if ($6 ~ /^[0-9.]+$/) { g += $6; gn++ }
+     }
+     END {
+       if (n)  printf "steady-state mean prompt_ms over %d turns: %.1f\n", n, s/n
+       if (an) printf "steady-state mean acceptance over %d turns: %.4f\n", an, a/an
+       if (gn) printf "steady-state mean tg t/s over %d turns: %.2f\n", gn, g/gn
+     }' "${OUT}" | tee -a "${OUT}"
 
 echo "done -> ${OUT}"

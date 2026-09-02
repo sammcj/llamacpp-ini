@@ -135,6 +135,11 @@ class Config:
         metadata={"env": "LLAMA_CACHE_DISK", "conv": Path},
     )
     cache_disk_max_mib: int = 32768  # ~900 MiB per 33k-token prompt
+    # Only these models get a disk cache. The cap is per model, so enabling it everywhere
+    # put ~544 GiB (17 x 32 GiB) of potential disk use behind a feature only the big slow
+    # models benefit from - a small model reloads faster than its cache restores. Matched
+    # as a substring, which also picks up the `mtp-` prefixed and `-no-mmproj` variants.
+    cache_disk_models: tuple[str, ...] = ("Qwen3.8",)
 
     @property
     def small_kv_bytes(self) -> int:
@@ -249,6 +254,8 @@ SIZE_TIERS: list[SizeTier] = [
 def cache_disk_overrides(name: str, cfg: Config) -> dict[str, str]:
     """Give each model its own prompt-cache directory - see Config.cache_disk_dir."""
     if not str(cfg.cache_disk_dir):
+        return {}
+    if not any(m.lower() in name.lower() for m in cfg.cache_disk_models):
         return {}
     return {
         "cache-disk": str(cfg.cache_disk_dir / name),

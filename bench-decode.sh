@@ -24,6 +24,14 @@ LOG="/tmp/claude/decode-${LABEL}.log"
 PORT="${PORT:-8973}"
 TEMP="${TEMP:-1.0}"
 NGEN="${NGEN:-400}"
+# f16 to match what this model is served with as of 2026-09-02 (see QWEN_NEXT.md); the
+# global default for every other model is still q8_0.
+KV="${KV:-f16}"
+# NMAX exists to test one specific value. Metal gates mul_mv_ext to ne11 <= 8 and a draft
+# of n submits a verify batch of n+1, so 7 is the largest draft that stays under the
+# bound and 8 falls off a 78ms cliff. 6 is what measured best before the bound was known;
+# 7 was never tried.
+NMAX="${NMAX:-6}"
 
 # Several different prompts: acceptance depends heavily on what is being generated
 # (tool-call JSON drafts far better than prose), so a single prompt says little.
@@ -52,8 +60,8 @@ cleanup() { [[ -n "${SRV}" ]] && kill "${SRV}" 2>/dev/null || true; }
 trap cleanup EXIT
 
 "${BIN}" -m "${MODEL}" --host 127.0.0.1 --port "${PORT}" \
-  -ctk q8_0 -ctv q8_0 -ngl 999 --ctx-size "${CTX}" -ub 2048 -b 2048 \
-  --spec-type draft-mtp --spec-draft-n-max 6 --draft-p-min 0.7 \
+  -ctk "${KV}" -ctv "${KV}" -ngl 999 --ctx-size "${CTX}" -ub 2048 -b 2048 \
+  --spec-type draft-mtp --spec-draft-n-max "${NMAX}" --draft-p-min 0.7 \
   --spec-draft-backend-sampling \
   --temp "${TEMP}" --top-k 20 --min-p 0.0 \
   --reasoning-format deepseek --reasoning-preserve \
