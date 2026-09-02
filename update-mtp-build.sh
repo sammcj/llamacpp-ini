@@ -9,18 +9,39 @@ set -euo pipefail
 # Usage: ./update-mtp-build.sh    (nothing changed: prompts to rebuild anyway on a
 #                                  terminal, skips silently when non-interactive)
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${LLAMA_REPO:-${HOME}/git/llama.cpp}"
 WORKTREE="${LLAMA_MTP_WORKTREE:-${HOME}/git/llama.cpp-pr27836}"
 PR=27836
 BRANCH="pr-${PR}-qwen4exp-mtp"
 PR_REF="refs/pr/${PR}"
-# PR 27977: qwen4exp long-context perf (ngram scan early-exit, QSA gather
-# windows, indexer sum fix, bitmap used-cells). Chosen over the overlapping
-# PR 27992 (kv-cell index): equal TG everywhere on M5 Max, but consistently
-# +3-5.5% PP at 32K-115K. NEVER carry both - the combination regressed TG
-# ~-18% at 32K in both-orders A/B.
-PR2=27977
-PR2_REF="refs/pr/${PR2}"
+# Extra PRs merged on top of the base, in order. Stacking is NOT free - #27992
+# plus #27977 together regressed TG ~18% at 32K - so each entry earns its place
+# with a both-orders A/B before it is added, and the reason lives beside it.
+#   28022 - preserves the prompt cache across an idle sleep. Without it, waking
+#           frees every cached prefix and the next prompt is fully cold: measured
+#           at 28903 tokens / 38.1 s after a sleep against 4 tokens / 0.08 s on a
+#           warm repeat. This is the single largest agent-workload win found.
+#   28232 - truncates speculative results at EOG before rollback, so draft-mtp
+#           stops leaving accepted tokens past the end-of-generation token in the
+#           slot (upstream issue #28049). Retest of an earlier void null.
+#   28092 - --cache-disk: the prompt cache persists to disk and reloads on start,
+#           covering the case #28022 does not - a restart or reboot, which is what
+#           every rebuild of this worktree causes.
+#   25788 - Metal gated_delta_net cache fusion, mirroring the CUDA path: the kernel
+#           writes recurrent-state snapshots straight into the KV cache instead of a
+#           per-layer cpy. 36 of our 48 trunk layers are GDN.
+#   27941 - qwen4exp follow-up fixes: indexer keys lost on sequence copy, blocks
+#           keyed per-sequence rather than by position alone (wrong under
+#           kv-unified, which is what our 4 auto slots run), and hand-edited
+#           GGUF asserts turned into throws - our model is a graft.
+#   28121 - flags ssm_a tensors not used with ggml_scan (4 lines).
+# Dropped: 27977 (closed upstream). 28136 (--lazy-mode on-direct) - null on Metal
+# at both a 5K and a 32K prompt, and needs a hand-applied ple_w compile fix every
+# run. 28213 (QSA gather) - the author's +6% at 31k and +50% at 130k are CUDA; on
+# Metal it measured slightly negative to 32k, null at 64k and +1.4% only at 128k,
+# so it loses at the depths this machine actually runs. See QWEN_NEXT.md.
+EXTRA_PRS=(28022 28232 28092 25788 27941 28121)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {
@@ -31,13 +52,21 @@ die() {
 [[ -d "${REPO}/.git" ]] || die "llama.cpp repo not found at ${REPO}"
 [[ -d "${WORKTREE}" ]] || die "worktree not found at ${WORKTREE} (see QWEN_NEXT.md)"
 
-echo "Fetching origin/master, PR #${PR} and PR #${PR2}..."
-git -C "${REPO}" fetch origin master \
-  "+refs/pull/${PR}/head:${PR_REF}" "+refs/pull/${PR2}/head:${PR2_REF}"
+echo "Fetching origin/master, PR #${PR} and ${#EXTRA_PRS[@]} extra PR(s)..."
+fetch_args=(origin master "+refs/pull/${PR}/head:${PR_REF}")
+for p in "${EXTRA_PRS[@]}"; do
+  fetch_args+=("+refs/pull/${p}/head:refs/pr/${p}")
+done
+git -C "${REPO}" fetch "${fetch_args[@]}"
 
 pr_head="$(git -C "${REPO}" rev-parse "${PR_REF}")"
-pr2_head="$(git -C "${REPO}" rev-parse "${PR2_REF}")"
 master_head="$(git -C "${REPO}" rev-parse origin/master)"
+# Parallel to EXTRA_PRS; indexed arrays rather than an associative one so the
+# ordering stays explicit (merge order changes the result).
+extra_heads=()
+for p in "${EXTRA_PRS[@]}"; do
+  extra_heads+=("$(git -C "${REPO}" rev-parse "refs/pr/${p}")")
+done
 
 if git -C "${REPO}" merge-base --is-ancestor "${PR_REF}" origin/master; then
   echo "PR #${PR} has MERGED upstream."
@@ -46,14 +75,18 @@ if git -C "${REPO}" merge-base --is-ancestor "${PR_REF}" origin/master; then
   exit 0
 fi
 
-# The marker records the revisions built, plus whether PR #PR2 made it in, so a
-# skipped run can still say that the existing build is missing it.
-marker_key="${pr_head}+${master_head}+${pr2_head}"
+# The marker records the revisions built plus each extra PR's outcome, so a
+# skipped run can still say the existing binary is missing one.
+marker_key="${pr_head}+${master_head}"
+for h in "${extra_heads[@]}"; do
+  marker_key+="+${h}"
+done
 
 if [[ -f "${MARKER}" ]] && [[ "$(cut -d' ' -f1 "${MARKER}")" == "${marker_key}" ]]; then
   echo "Already built against this PR head and master."
-  if [[ "$(cut -d' ' -f2 "${MARKER}")" == "MISSING" ]]; then
-    echo "warning: that build does NOT include PR #${PR2} (long-context perf)." >&2
+  missing="$(cut -d' ' -f2- "${MARKER}" | tr ' ' '\n' | grep ':MISSING$' || true)"
+  if [[ -n "${missing}" ]]; then
+    echo "warning: that build is MISSING ${missing//:MISSING/}" >&2
   fi
   # Only offer the rebuild when someone is there to answer; piped or scheduled
   # runs keep the old skip-and-exit behaviour rather than blocking on read.
@@ -67,6 +100,42 @@ if [[ -f "${MARKER}" ]] && [[ "$(cut -d' ' -f1 "${MARKER}")" == "${marker_key}" 
     exit 0
   fi
   echo "Rebuilding at the same revisions."
+fi
+
+# The previous run left patches/ applied, which is a dirty tree as far as the guard
+# below is concerned. Reverse them first: if that restores a clean tree, the only
+# edits were ours and there is nothing to warn about. Anything that fails to reverse
+# was not ours and still trips the guard.
+shopt -s nullglob
+patches=("${SCRIPT_DIR}"/patches/*.patch)
+shopt -u nullglob
+# --index because the forward apply below uses --3way, which stages what it applies -
+# reverting the working tree alone would leave the index dirty and trip the guard.
+# Not --3way here: that insists the file already matches the index. Falling back to a
+# working-tree-only revert covers a tree that was reset but not unstaged.
+for patch in "${patches[@]}"; do
+  git -C "${WORKTREE}" apply -R --index "${patch}" >/dev/null 2>&1 \
+    || git -C "${WORKTREE}" apply -R "${patch}" >/dev/null 2>&1 \
+    || true
+done
+
+# checkout -B rebuilds the branch from the PR head every run, so a tracked file
+# edited by hand (a local compile fix, say) both blocks the checkout with a bare
+# git error and cannot survive anyway. Say which files and how to park them.
+dirty="$(git -C "${WORKTREE}" status --porcelain --untracked-files=no)"
+if [[ -n "${dirty}" ]]; then
+  {
+    echo "Error: ${WORKTREE} has uncommitted changes:"
+    echo "  ${dirty//$'\n'/$'\n'  }"
+    echo "checkout -B would discard them. Park or drop them first:"
+    echo "  git -C ${WORKTREE} stash push -m 'wip'"
+    echo
+    echo
+    echo "The two patches this build needs are applied from patches/ automatically;"
+    echo "they are not what this is complaining about. If you edited one by hand,"
+    echo "regenerate it (see patches/README.md) rather than leaving it in the tree."
+  } >&2
+  exit 1
 fi
 
 echo "Updating ${BRANCH} to PR head ${pr_head:0:9}..."
@@ -114,14 +183,30 @@ try_merge origin/master "origin/master (${master_head:0:9})" || true
 # Ancestry only catches a plain merge upstream; a squash or rebase merge lands
 # the same code under a new SHA and still fails this test, so the merge below is
 # what actually decides.
-if git -C "${REPO}" merge-base --is-ancestor "${PR2_REF}" origin/master; then
-  echo "PR #${PR2} has merged upstream; skipping its merge (remove it from this script)."
-  pr2_state="upstream"
-elif try_merge "${PR2_REF}" "PR #${PR2} (${pr2_head:0:9})"; then
-  pr2_state="merged"
-else
-  pr2_state="MISSING"
-fi
+extra_states=()
+for i in "${!EXTRA_PRS[@]}"; do
+  p="${EXTRA_PRS[$i]}"
+  h="${extra_heads[$i]}"
+  if git -C "${REPO}" merge-base --is-ancestor "refs/pr/${p}" origin/master; then
+    echo "PR #${p} has merged upstream; skipping its merge (drop it from EXTRA_PRS)."
+    extra_states+=("#${p}:upstream")
+  elif try_merge "refs/pr/${p}" "PR #${p} (${h:0:9})"; then
+    extra_states+=("#${p}:merged")
+  else
+    extra_states+=("#${p}:MISSING")
+  fi
+done
+
+# Local patches, applied after the merges and before the build. checkout -B above
+# rebuilds the branch from the PR head every run, so these cannot be carried as
+# working-tree edits or stashes - one of them is the difference between a build that
+# compiles on macOS and one that does not, and the other is a silent 8x. --3way lets
+# them survive upstream moving the surrounding code. See patches/README.md.
+for patch in "${patches[@]}"; do
+  git -C "${WORKTREE}" apply --3way "${patch}" \
+    || die "local patch $(basename "${patch}") no longer applies; fix it before building"
+  echo "Applied $(basename "${patch}")."
+done
 
 # Use the same cmake preset as the main repo's build.sh (untracked file, so the
 # worktree does not inherit it). Deliberately no `cmake --install`: the PR build
@@ -147,12 +232,13 @@ echo "Building llama-server, llama-cli, llama-bench (preset: local)..."
 cmake --build "${WORKTREE}/build" --target llama-server llama-cli llama-bench -j \
   || die "build failed"
 
-echo "${marker_key} ${pr2_state}" > "${MARKER}"
+echo "${marker_key} ${extra_states[*]}" > "${MARKER}"
 "${WORKTREE}/build/bin/llama-server" --version
-case "${pr2_state}" in
-  merged)   echo "PR #${PR2} (long-context perf): included." ;;
-  upstream) echo "PR #${PR2}: merged upstream, no longer carried separately." ;;
-  MISSING)  echo "warning: PR #${PR2} (long-context perf) is NOT in this build;" \
-                 "expect lower prefill at depth (see QWEN_NEXT.md)." >&2 ;;
-esac
+for s in "${extra_states[@]}"; do
+  case "${s##*:}" in
+    merged)   echo "${s%%:*}: included." ;;
+    upstream) echo "${s%%:*}: merged upstream, no longer carried separately." ;;
+    MISSING)  echo "warning: ${s%%:*} is NOT in this build (see QWEN_NEXT.md)." >&2 ;;
+  esac
+done
 echo "Done. The router picks this up via LLAMA_SERVER_BIN in samm-mbp.env."

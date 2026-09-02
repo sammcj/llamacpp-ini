@@ -125,6 +125,16 @@ class Config:
         metadata={"env": "QWEN_CHAT_TEMPLATE", "conv": Path},
     )
     qwen_template_min: tuple[int, int] = (3, 5)  # lowest Qwen version that gets it
+    # PR #28092's --cache-disk. Written per model rather than once in the launcher,
+    # because the router renders its own CLI args into every child (server_models
+    # builds base_preset from argc/argv) and a child deletes every entry in the
+    # directory whose cache key is not its own. One shared path means loading a
+    # second model wipes the first model's cache. Set empty to disable.
+    cache_disk_dir: Path = field(
+        default=Path.home() / ".cache" / "llama.cpp" / "prompt-cache",
+        metadata={"env": "LLAMA_CACHE_DISK", "conv": Path},
+    )
+    cache_disk_max_mib: int = 32768  # ~900 MiB per 33k-token prompt
 
     @property
     def small_kv_bytes(self) -> int:
@@ -234,6 +244,16 @@ SIZE_TIERS: list[SizeTier] = [
         },
     ),
 ]
+
+
+def cache_disk_overrides(name: str, cfg: Config) -> dict[str, str]:
+    """Give each model its own prompt-cache directory - see Config.cache_disk_dir."""
+    if not str(cfg.cache_disk_dir):
+        return {}
+    return {
+        "cache-disk": str(cfg.cache_disk_dir / name),
+        "cache-disk-max": str(cfg.cache_disk_max_mib),
+    }
 
 
 def size_overrides(name: str, weight_bytes: int, cfg: Config) -> dict[str, str]:
@@ -624,6 +644,7 @@ class Sync:
         sized = bool(overrides)
         overrides.update(self._template_overrides(name))
         overrides.update(sampler_overrides(name))
+        overrides.update(cache_disk_overrides(name, self.cfg))
         if not twin:
             self.size_tiered += sized
             self.templated += "chat-template-file" in overrides

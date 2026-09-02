@@ -1,0 +1,23 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 53c988991..d73e4329b 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -64,7 +64,8 @@ static void server_prompt_cache_key_add_file(
+ 
+     ec.clear();
+     const auto modified = std::filesystem::last_write_time(path, ec);
+-    key << "|mtime=" << (ec ? 0 : modified.time_since_epoch().count()) << "\n";
++    // libc++'s file_clock has an __int128 rep on macOS, which no operator<< accepts.
++    key << "|mtime=" << (ec ? 0 : (long long) modified.time_since_epoch().count()) << "\n";
+ }
+ 
+ static std::string server_prompt_cache_key(
+@@ -3690,7 +3691,7 @@ private:
+                         //  - 4
+                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+                         if (do_checkpoint) {
+-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
++                            static const int checkpoint_offsets[] = {4 + n_ubatch, 64, 4};
+ 
+                             bool should_break = false;
+                             for (int offset : checkpoint_offsets) {
