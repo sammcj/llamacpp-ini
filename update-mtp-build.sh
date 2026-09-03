@@ -31,22 +31,35 @@ PR_REF="refs/pr/${PR}"
 #   25788 - Metal gated_delta_net cache fusion, mirroring the CUDA path: the kernel
 #           writes recurrent-state snapshots straight into the KV cache instead of a
 #           per-layer cpy. 36 of our 48 trunk layers are GDN.
-#   27941 - qwen4exp follow-up fixes: indexer keys lost on sequence copy, blocks
-#           keyed per-sequence rather than by position alone (wrong under
-#           kv-unified, which is what our 4 auto slots run), and hand-edited
-#           GGUF asserts turned into throws - our model is a graft.
-#   28121 - flags ssm_a tensors not used with ggml_scan (4 lines).
+# Merged upstream, so they now arrive through origin/master and are no longer
+# listed: 27941 (qwen4exp follow-up fixes) and 28121 (ssm_a/ggml_scan flag), both
+# squash-merged 2026-09-01. A squash lands the code under a new SHA, so the
+# ancestry check below never fired for either and they were being re-merged on
+# every run; the GitHub state check is what caught them.
 # Dropped: 27977 (closed upstream). 28136 (--lazy-mode on-direct) - null on Metal
 # at both a 5K and a 32K prompt, and needs a hand-applied ple_w compile fix every
 # run. 28213 (QSA gather) - the author's +6% at 31k and +50% at 130k are CUDA; on
 # Metal it measured slightly negative to 32k, null at 64k and +1.4% only at 128k,
 # so it loses at the depths this machine actually runs. See QWEN_NEXT.md.
-EXTRA_PRS=(28022 28232 28092 25788 27941 28121)
+EXTRA_PRS=(28022 28232 28092 25788)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {
   echo "Error: ${1}" >&2
   exit 1
+}
+
+# Ancestry against origin/master cannot tell a PR that was closed without merging
+# from one that is still open - both stay non-ancestors forever - so a dead PR
+# keeps being merged in silently (#27977 did exactly that). Ask GitHub instead.
+# Best-effort: no gh, no auth or no network leaves every state empty and the rest
+# of the script behaves as before.
+REPO_SLUG="$(git -C "${REPO}" remote get-url origin 2>/dev/null \
+  | sed -E 's#^.*github\.com[:/]##; s#\.git$##')"
+
+pr_state() {
+  [[ -n "${REPO_SLUG}" ]] || return 0
+  gh pr view "${1}" --repo "${REPO_SLUG}" --json state --jq .state 2>/dev/null || true
 }
 
 [[ -d "${REPO}/.git" ]] || die "llama.cpp repo not found at ${REPO}"
@@ -68,11 +81,49 @@ for p in "${EXTRA_PRS[@]}"; do
   extra_heads+=("$(git -C "${REPO}" rev-parse "refs/pr/${p}")")
 done
 
+# Queried before the already-built skip below, because closing a PR does not move
+# its head - the marker stays valid and a no-op run would otherwise never mention it.
+base_state=""
+extra_states_upstream=()
+closed_prs=()
+if command -v gh >/dev/null 2>&1; then
+  base_state="$(pr_state "${PR}")"
+  for p in "${EXTRA_PRS[@]}"; do
+    extra_states_upstream+=("$(pr_state "${p}")")
+  done
+  if [[ -z "${base_state}" ]]; then
+    echo "warning: could not read PR state from GitHub (gh unauthenticated or offline);" >&2
+    echo "         skipping the closed-PR check." >&2
+  fi
+else
+  echo "note: gh not installed; skipping the closed-PR check." >&2
+fi
+
+if [[ "${base_state}" == "CLOSED" ]]; then
+  echo "warning: PR #${PR} was CLOSED upstream without merging. This whole build" >&2
+  echo "         exists to carry it - check whether it was superseded before you" >&2
+  echo "         keep rebuilding against a dead branch." >&2
+fi
+
+for i in "${!EXTRA_PRS[@]}"; do
+  if [[ "${extra_states_upstream[$i]:-}" == "CLOSED" ]]; then
+    closed_prs+=("${EXTRA_PRS[$i]}")
+    echo "warning: PR #${EXTRA_PRS[$i]} was CLOSED upstream without merging; it is still" >&2
+    echo "         merged here. Drop it from EXTRA_PRS unless you mean to keep carrying it." >&2
+  fi
+done
+
 if git -C "${REPO}" merge-base --is-ancestor "${PR_REF}" origin/master; then
   echo "PR #${PR} has MERGED upstream."
   echo "Retire this setup: build main as usual, delete the LLAMA_SERVER_BIN"
   echo "override in samm-mbp.env, then: git -C ${REPO} worktree remove ${WORKTREE}"
   exit 0
+fi
+
+if [[ "${base_state}" == "MERGED" ]]; then
+  echo "warning: PR #${PR} shows MERGED upstream but its head is not an ancestor of" >&2
+  echo "         master - a squash or rebase merge. The code is probably in master" >&2
+  echo "         already; check before rebuilding, then retire this setup." >&2
 fi
 
 # The marker records the revisions built plus each extra PR's outcome, so a
@@ -190,7 +241,13 @@ for i in "${!EXTRA_PRS[@]}"; do
   if git -C "${REPO}" merge-base --is-ancestor "refs/pr/${p}" origin/master; then
     echo "PR #${p} has merged upstream; skipping its merge (drop it from EXTRA_PRS)."
     extra_states+=("#${p}:upstream")
-  elif try_merge "refs/pr/${p}" "PR #${p} (${h:0:9})"; then
+    continue
+  fi
+  if [[ "${extra_states_upstream[$i]:-}" == "MERGED" ]]; then
+    echo "PR #${p} shows MERGED upstream under a different SHA (squash or rebase);" >&2
+    echo "         its merge below is likely a no-op. Drop it from EXTRA_PRS." >&2
+  fi
+  if try_merge "refs/pr/${p}" "PR #${p} (${h:0:9})"; then
     extra_states+=("#${p}:merged")
   else
     extra_states+=("#${p}:MISSING")
@@ -241,4 +298,9 @@ for s in "${extra_states[@]}"; do
     MISSING)  echo "warning: ${s%%:*} is NOT in this build (see QWEN_NEXT.md)." >&2 ;;
   esac
 done
+# Repeated here because the state query runs before the merges and the build, far
+# enough up the output to be scrolled away by the time the build finishes.
+if [[ ${#closed_prs[@]} -gt 0 ]]; then
+  echo "warning: CLOSED upstream but still carried: ${closed_prs[*]/#/#}" >&2
+fi
 echo "Done. The router picks this up via LLAMA_SERVER_BIN in samm-mbp.env."
