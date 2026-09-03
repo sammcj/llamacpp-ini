@@ -59,7 +59,11 @@ REPO_SLUG="$(git -C "${REPO}" remote get-url origin 2>/dev/null \
 
 pr_state() {
   [[ -n "${REPO_SLUG}" ]] || return 0
-  gh pr view "${1}" --repo "${REPO_SLUG}" --json state --jq .state 2>/dev/null || true
+  # An exported GITHUB_TOKEN outranks gh's own stored credentials and 401s when it
+  # is stale. The interactive shell hides this behind a `gh` function that blanks
+  # the variable (shell_config/9-functions.rc); a script inherits the variable but
+  # not the function, so blank it here too and let gh use its keyring auth.
+  GITHUB_TOKEN="" GH_TOKEN="" gh pr view "${1}" --repo "${REPO_SLUG}" --json state --jq .state 2>/dev/null || true
 }
 
 [[ -d "${REPO}/.git" ]] || die "llama.cpp repo not found at ${REPO}"

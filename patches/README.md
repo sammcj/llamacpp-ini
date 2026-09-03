@@ -8,8 +8,8 @@ Regenerate after changing them by hand:
 
 ## 0001-server-context-local.patch
 
-Two changes, both in `tools/server/server-context.cpp`.
+One change, in `tools/server/server-context.cpp`.
 
 **A third context checkpoint at 64 tokens.** `checkpoint_offsets` upstream is `{4 + n_ubatch, 4}`, so a prefix that diverges anywhere inside a ubatch falls back to replaying the whole ubatch. On the shape a new agent session actually produces this measured 2047 tokens / 3.6 s against 63 tokens / 0.45 s with the extra offset. See UPSTREAM-CANDIDATES.md.
 
-**A `(long long)` cast on `last_write_time().count()`** in PR #28092's disk cache key. libc++'s `file_clock` has an `__int128` rep on macOS and no `operator<<` accepts it, so without this the server does not compile at all. Submitted upstream 2026-09-03 as [yitizi/llama.cpp#1](https://github.com/yitizi/llama.cpp/pull/1), a PR into #28092's own branch (`pr2-standalone`). Delete this half once that merges and `update-mtp-build.sh` picks up the new head.
+Retired 2026-09-03: a `(long long)` cast on `last_write_time().count()` in PR #28092's disk cache key, without which the server did not compile on macOS at all (libc++'s `file_clock` has an `__int128` rep and no `operator<<` accepts it). Submitted upstream as [yitizi/llama.cpp#1](https://github.com/yitizi/llama.cpp/pull/1) into #28092's own branch; the author force-pushed it in as `static_cast<long long>` (head `6deebd45f`), at which point our half stopped applying and had to be dropped by hand. A force-push to a PR that a local patch touches is the failure mode to expect here.
