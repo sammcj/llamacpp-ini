@@ -30,7 +30,16 @@ PR_REF="refs/pr/${PR}"
 #           every rebuild of this worktree causes.
 #   25788 - Metal gated_delta_net cache fusion, mirroring the CUDA path: the kernel
 #           writes recurrent-state snapshots straight into the KV cache instead of a
-#           per-layer cpy. 36 of our 48 trunk layers are GDN.
+#           per-layer cpy. 36 of our 48 trunk layers are GDN. Superseded upstream by
+#           ggerganov's #28164, which absorbs it into a single-source fusion table;
+#           swap to that one once it merges.
+#   28330 - the indexer KV cache allocates a V half it never reads. Four lines, and
+#           at our 131072 ctx it hands back 408 MiB (612 -> 204 MiB) against a
+#           model+KV budget that already runs close to the 128 GB ceiling.
+#   28302 - create_checkpoint()'s spacing eviction deletes the n_tokens-4 checkpoint
+#           on any prompt shorter than checkpoint_min_step (8192), which is the same
+#           failure patches/0001 works around from the other end. Different function,
+#           no overlap with the patch.
 # Merged upstream, so they now arrive through origin/master and are no longer
 # listed: 27941 (qwen4exp follow-up fixes) and 28121 (ssm_a/ggml_scan flag), both
 # squash-merged 2026-09-01. A squash lands the code under a new SHA, so the
@@ -40,8 +49,11 @@ PR_REF="refs/pr/${PR}"
 # at both a 5K and a 32K prompt, and needs a hand-applied ple_w compile fix every
 # run. 28213 (QSA gather) - the author's +6% at 31k and +50% at 130k are CUDA; on
 # Metal it measured slightly negative to 32k, null at 64k and +1.4% only at 128k,
-# so it loses at the depths this machine actually runs. See QWEN_NEXT.md.
-EXTRA_PRS=(28022 28232 28092 25788)
+# so it loses at the depths this machine actually runs. 28301 (Metal mul_mm_id
+# half-tile skip) - costs 4.1% prefill and 5.1% decode here, reproducibly. 28118
+# (on-device speculative checkpoints) - null on Metal and it aborts the server on
+# the first cached follow-up. See QWEN_NEXT.md.
+EXTRA_PRS=(28022 28232 28092 25788 28330 28302)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {

@@ -432,7 +432,17 @@ Everything above this line ran `cache_prompt=false`, the cold-start worst case. 
 
 On stock the replay is one ubatch, so it does scale with `-ub` - the earlier `-ub 1024` reasoning was right about the mechanism. With the patch the replay is 74 tokens and `-ub` stops mattering (470.5 ms at 2048 vs 469.4 at 1024), so `ubatch-size = 2048` stays on the cold-prefill tuning. If the patch is ever dropped, revisit that line.
 
-**One artefact to know about.** `sweep-cache.sh` reports a 2054-token replay per extend even on the patched build, because it extends a conversation whose *previous* request was an exact repeat - a repeat prefills 4 tokens and lays down no usable checkpoint. That shape does not occur in agent traffic; the per-turn figures above come from a growing-conversation harness instead.
+**The 2054-token extend was a second bug, fixed by #28302 (2026-09-04).** `sweep-cache.sh` used to report a 2054-token replay per extend even on the patched build. That was read here as an artefact of the script's shape - it extends a conversation whose *previous* request was an exact repeat, and a repeat prefills 4 tokens - but the shape was only half of it. `create_checkpoint()` runs a spacing eviction before appending, walking from the oldest entry and deleting any checkpoint from another task within `checkpoint_min_step` (8192) of the previous survivor. On a prompt shorter than that, every checkpoint qualifies, so only the oldest survived and the near-end one the patch had just placed was thrown away. [#28302](https://github.com/ggml-org/llama.cpp/pull/28302) runs the eviction only when the checkpoint list is full and supersedes a same-`n_tokens` entry instead of appending a duplicate. Same script, same 5963-token prompt, with the PR in:
+
+| request | prompt_n | prompt_ms |
+|---|---|---|
+| base (cold) | 5963 | 7171.8 |
+| base (repeat) | 4 | 59.8 |
+| base + suffix | 70 | 396.7 |
+| base + suffix2 | 69 | 380.9 |
+| base (cache off) | 5963 | 7122.7 |
+
+70 against 2054, so the extend rows now agree with the growing-conversation harness. The two fixes are complementary and neither substitutes for the other: patch 0001 places a checkpoint that survives divergence, #28302 stops the eviction from deleting it. This only bites below `checkpoint_min_step`, which is why the 28903-token measurements never showed it.
 
 **Mechanism.** `n_rs_seq` is not the cause. The replay length is set by `tools/server/server-context.cpp:3538`:
 
@@ -485,6 +495,33 @@ This invalidated two results here before it was caught, and the tell was in the 
 Consequences, both now corrected above: the `{4 + n_ubatch, 64, 4}` offset was first written off as null when it is a 5x win, and the `N_R0` test below compared a binary against itself.
 
 **Untested, previously mis-reported as null:** `N_R0_IQ3_S` 4 to 8 and `N_R0_IQ4_NL` 2 to 4 in `ggml/src/ggml-metal/ggml-metal-impl.h`, the transferable half of PR #28086. The A/B that produced "pp 1044.75 to 1045.72, tg 49.46 to 49.45" loaded one `libggml-metal.dylib` for both arms and means nothing. Correctness did pass `test-backend-ops` on MUL_MAT and MUL_MAT_ID. Needs redoing with rebuilds in place.
+
+## Methodology trap: the machine drifts ~8% while you are using it (2026-09-04)
+
+The companion to the rpath trap above, and it bit the same day. Rebuilding in place fixes *which code* runs; it does nothing about *what else* the machine is doing between arms.
+
+Measured accidentally. Two stacks were benchmarked an hour apart that differed only by a server-only PR - code in `tools/server/`, which `llama-bench` does not link and cannot execute. It should have been a bit-for-bit identical result. It was **748-768 pp against 813, and 36.5-38.4 tg against 42.1**. `ps -Ao %cpu,comm -r` then showed `IDriveDaemon` at ~30% and a browser spread over ~50% across helper processes, load average 3.79. The backup daemon had started somewhere between the arms.
+
+What makes this hard to catch is that *within* a window the numbers look excellent: back-to-back repeats came back 779.68 and 779.83 pp, 40.17 and 39.94 tg. `llama-bench`'s own error bars measure repeat variance inside one process and say nothing about the hour-scale drift between builds.
+
+Practical rules:
+
+- Log `uptime` and `ps -Ao %cpu,comm -r | head` at the start of every arm, into the same file as the result.
+- Treat any cross-arm delta under about 10% as unresolved unless both arms were measured inside the same quiet window.
+- Prefer evidence that is not wall-clock at all where the change admits it. `llama_kv_cache: size` in MiB and `timings.prompt_n` in tokens are exact, and neither moves when a backup daemon starts. Both PRs kept from the 2026-09-04 scan were confirmed that way; the one that needed timing to justify itself could not be settled and was dropped.
+
+## Indexer KV cache: 408 MiB back from #28330 (2026-09-04, measured)
+
+`llama_memory_hybrid_idx` builds a `llama_kv_cache` for the indexer keys, and `llama_kv_cache` allocates a V half by default unless the model is MLA. The indexer never reads V. [#28330](https://github.com/ggml-org/llama.cpp/pull/28330) sets `n_embd_head_{k,v}_mla_impl` on the indexer's private hparams so the allocation is skipped - four lines, no API change.
+
+At `--ctx-size 131072`, from the server log either side:
+
+| | K (q8_0) | V (q8_0) | total |
+|---|---|---|---|
+| before | 204.00 MiB | 408.00 MiB | 612.00 MiB |
+| after | 204.00 MiB | 0.00 MiB | 204.00 MiB |
+
+`common_params_fit_impl` drops 68886 -> 68478 MiB projected. Small against the 128 GB budget, but it is free and it is exact.
 
 ## The model is not IQ4_XS (2026-09-02)
 
