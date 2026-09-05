@@ -523,6 +523,71 @@ At `--ctx-size 131072`, from the server log either side:
 
 `common_params_fit_impl` drops 68886 -> 68478 MiB projected. Small against the 128 GB budget, but it is free and it is exact.
 
+## Sampling temperature costs 12% decode, and does not explain real-world acceptance (2026-09-04, measured)
+
+`bench-decode.sh`'s header asks whether the acceptance gap is sampling-induced. It is, partly. Four arms, `NGEN=120`, three prompts each, same build, machine idle:
+
+| temp | acceptance | mean len | tg t/s |
+|---|---|---|---|
+| 0 | 0.824 | 3.92 | 63.1 |
+| 0.6 | 0.730 | 3.53 | 59.6 |
+| 0.7 | 0.681 | 3.41 | 56.0 |
+| 1.0 | 0.698 | 3.35 | 55.4 |
+
+The draft is greedy and verification is exact token equality, so every off-argmax draw from the target ends the chain. Going from the production `--temperature 1.0` to `0.6` is worth **+7.6% decode** (55.4 -> 59.6 t/s) and costs nothing to try. 0.7 and 1.0 are indistinguishable here; the useful step is 0.6 or lower. temp 0 is the ceiling, not an option - it gives up sampling entirely.
+
+**What this does not explain.** A real pi coding session measured acceptance of **0.45-0.84, mean 0.60** over nine requests, which is *below* even the temp-1.0 bench figure of 0.698. Temperature is not the main term in real traffic. The bench prompts are short and start from an empty context; the session ran at 17k-55k depth. Do not read the 0.824 temp-0 number as a target that tuning can approach.
+
+## What a real pi session actually looks like (2026-09-04, measured)
+
+Nine requests, cold start to 55k tokens, production router config. This is the first end-to-end agent trace recorded here rather than a synthetic harness.
+
+| n | prefill tok | prefill t/s | tg t/s | acceptance | mean len | end depth |
+|---|---|---|---|---|---|---|
+| 1 | 17523 | 733 | 64.2 | 0.787 | 5.02 | 17819 |
+| 2 | 3407 | 741 | 49.3 | 0.642 | 3.66 | 21653 |
+| 3 | 8424 | 738 | 61.9 | 0.844 | 5.35 | 30252 |
+| 4 | 4509 | 695 | 46.5 | 0.524 | 3.80 | 34971 |
+| 5 | 2611 | 646 | 50.1 | 0.463 | 5.52 | 37777 |
+| 6 | 767 | 517 | 51.0 | 0.453 | 5.07 | 38762 |
+| 7 | 1461 | 584 | 43.7 | 0.522 | 3.63 | 40561 |
+| 8 | 6195 | 647 | 40.1 | 0.463 | 3.53 | 46642 |
+| 9 | 6202 | 632 | 39.5 | 0.679 | 3.23 | 55373 |
+
+**The prompt cache is doing its job.** `f_keep = 1.000` on six of eight follow-ups, `f_sim_best` 0.72-0.98. The per-turn prefill is genuinely new tool output, not re-prefill - request 3 prefilled 8424 tokens at `f_keep 1.000` because pi sent that much new content. Prefill was 74 s of the session's 188 s of model time.
+
+**Prefill halves with depth inside a single request.** Windowing request 1's progress lines by full 2048-token ubatches:
+
+```
+     0-6144    1374.5 t/s
+  6144-8192     914.3
+  8192-10240    853.3
+ 10240-12288    755.7
+ 12288-14336    664.9
+```
+
+(The two windows after that are partial ubatches and measure batch size, not depth.)
+
+**Depth tracks decode at least as strongly as mean accepted length here.** Over the nine requests, tg vs depth is **r = -0.798**, tg vs mean length **r = +0.778**, tg vs acceptance **r = +0.650**. The section above states decode tracks mean accepted length *and not* context depth. With n=9 and the two confounded - later turns are both deeper and lower-mean-len - this does not refute it, but that claim is not settled and should not be relied on for tuning decisions.
+
+## `--cache-disk` works; every rebuild wipes it (2026-09-04, measured)
+
+A real pi session left the cache directory **empty**, with `restored 0 persistent prompt cache entries` at startup. The feature itself is fine - tested directly:
+
+- **Writes during the session.** Two requests at `--ctx-size 32768` produced a 228 MiB `.bin` plus a 1.3 KiB `.bin.meta`.
+- **Survives exit.** Both files still present after SIGTERM.
+- **Restores on restart.** Identical args: `restored 1 persistent prompt cache entries (227.561 MiB)`.
+
+**The invalidation cause is in the key.** `server_prompt_cache_key()` (`tools/server/server-context.cpp`) opens with:
+
+```
+key << "commit=" << llama_commit() << "\n";
+```
+
+So **every rebuild of this worktree destroys the whole disk cache**, which is exactly the `removing incompatible or invalid disk prompt cache entry` line in the session log. On a machine where the PR stack is rebuilt regularly this is not a corner case, it is the normal state. The key also covers model path, `n_ctx`, `n_batch`, `n_ubatch`, `n_parallel`, both KV types, `kv_unified` and `flash_attn`. It does **not** include the port, so the router's ephemeral child port is not a factor.
+
+**Still unexplained:** why that session's own writes were not on disk at the end. Not reproducible from the flags it was launched with. Next live session, check `ls -la ~/.cache/llama.cpp/prompt-cache/Qwen3.8-Flash-Next-MTP-Merged-GGUF/` *while* pi is mid-conversation - if files are there, the loss happens at teardown; if not, the write path is not firing under the router's config.
+
 ## The model is not IQ4_XS (2026-09-02)
 
 Worth knowing before anyone optimises for the name on the tin. Actual tensor-type composition:
