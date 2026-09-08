@@ -40,6 +40,29 @@ PR_REF="refs/pr/${PR}"
 #           on any prompt shorter than checkpoint_min_step (8192), which is the same
 #           failure patches/0001 works around from the other end. Different function,
 #           no overlap with the patch.
+#   28473 - fixes draft-mtp cross-slot content contamination with --parallel > 1
+#           (upstream issue #28286). samm-mbp.ini runs parallel auto (4 slots), so
+#           this is a correctness fix, not a speed one. Output stays plausible when
+#           it misfires, which is why nobody noticed.
+#   28333 - zeroes the MTP carrier at sequence start. Without it the carrier
+#           persists between requests and identical deterministic requests can
+#           produce different tokens, which invalidates paired A/B runs against a
+#           long-lived server. Five lines.
+#   28305 - keeps the backend sampling subgraph a fixed shape across ubatches. The
+#           spec-dec verify step samples the whole accepted draft window, so the
+#           row count varies per verify and can trigger a ggml-alloc realloc; we
+#           run spec-draft-backend-sampling = 1. Decode effect not yet measured.
+#   28439 - Metal flash-attn wide query tile (8 -> 16 rows) when ne01 >= 64 and
+#           head size pads to a multiple of 128. Our DK=DV=256 hits the gate. The
+#           author's M5 numbers are -34% at 16K and -47% at 64K KV on hs 256, but
+#           the vec and sparse paths are untouched, so the patches/0002 QSA layers
+#           gain nothing and attention is ~5% of prefill here. Measured as part of
+#           the four-PR arm 2026-09-08: null at 33k cold prefill (see
+#           UPSTREAM-CANDIDATES.md). Kept as free; untested at 64k+.
+# Candidates not yet taken: 27210 (adaptive MTP draft depth) conflicts with 28473
+# in common/speculative.cpp and needs spec-draft-n-max >= 7 (we run 5), so it is
+# a retune, not a drop-in. 25592 (hybrid checkpoint validity) rewrites the same
+# checkpoint-selection predicate 28092 does; semantic conflict, parked.
 # Merged upstream, so they now arrive through origin/master and are no longer
 # listed: 27941 (qwen4exp follow-up fixes) and 28121 (ssm_a/ggml_scan flag), both
 # squash-merged 2026-09-01. A squash lands the code under a new SHA, so the
@@ -53,7 +76,7 @@ PR_REF="refs/pr/${PR}"
 # half-tile skip) - costs 4.1% prefill and 5.1% decode here, reproducibly. 28118
 # (on-device speculative checkpoints) - null on Metal and it aborts the server on
 # the first cached follow-up. See QWEN_NEXT.md.
-EXTRA_PRS=(28022 28232 28092 25788 28330 28302)
+EXTRA_PRS=(28022 28232 28092 25788 28330 28302 28473 28333 28305 28439)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {

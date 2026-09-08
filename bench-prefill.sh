@@ -24,7 +24,10 @@ LABEL="${1:?usage: bench-prefill.sh <label>}"
 BIN="${SERVER_BIN:-/Users/samm/git/llama.cpp-pr27836/build/bin/llama-server}"
 MODEL="${MTP_MODEL:-${HOME}/git/sammcj/llamacpp-ini/models/Qwen3.8-Flash-Next-MTP-Merged-GGUF/Qwen3.8-Flash-Next-MTP-UD-IQ4_XS-00001-of-00004.gguf}"
 TEMPLATE="${HOME}/git/Qwen-Fixed-Chat-Templates/chat_template.jinja"
-PROMPT_DIR="${PROMPT_DIR:-/tmp/claude/pf}"
+# Committed prompts, not /tmp: a temp cleanup emptied the old directory and the run
+# silently sent empty bodies. Regenerate with bench-prompts/generate.py only when
+# you also intend to re-baseline, since every arm must see byte-identical prompts.
+PROMPT_DIR="${PROMPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bench-prompts}"
 OUT="/tmp/claude/prefill-${LABEL}.txt"
 LOG="/tmp/claude/prefill-${LABEL}.log"
 PORT="${PORT:-8971}"
@@ -63,7 +66,12 @@ done
   printf '%-6s %10s %12s %12s\n' prompt tokens ms tok_per_s
 } | tee "${OUT}"
 
-for p in "${PROMPT_DIR}"/*.txt; do
+shopt -s nullglob
+prompts=("${PROMPT_DIR}"/*.txt)
+shopt -u nullglob
+[[ ${#prompts[@]} -gt 0 ]] || { echo "no prompt files in ${PROMPT_DIR}" >&2; exit 1; }
+
+for p in "${prompts[@]}"; do
   # max_tokens 1: generation is not what is being measured, and a long answer would
   # only add noise from the draft/verify path on top of the prefill number.
   r="$(curl -sS -m 1800 "http://127.0.0.1:${PORT}/v1/chat/completions" \
