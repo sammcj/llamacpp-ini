@@ -51,14 +51,17 @@ PR_REF="refs/pr/${PR}"
 #   28305 - keeps the backend sampling subgraph a fixed shape across ubatches. The
 #           spec-dec verify step samples the whole accepted draft window, so the
 #           row count varies per verify and can trigger a ggml-alloc realloc; we
-#           run spec-draft-backend-sampling = 1. Decode effect not yet measured.
+#           run spec-draft-backend-sampling = 1. Measured 2026-09-08 with
+#           bench-decode.sh ABAB: null (tg 57.0/56.9/56.8/56.5). Kept as harmless.
 #   28439 - Metal flash-attn wide query tile (8 -> 16 rows) when ne01 >= 64 and
 #           head size pads to a multiple of 128. Our DK=DV=256 hits the gate. The
 #           author's M5 numbers are -34% at 16K and -47% at 64K KV on hs 256, but
 #           the vec and sparse paths are untouched, so the patches/0002 QSA layers
 #           gain nothing and attention is ~5% of prefill here. Measured as part of
 #           the four-PR arm 2026-09-08: null at 33k cold prefill (see
-#           UPSTREAM-CANDIDATES.md). Kept as free; untested at 64k+.
+#           UPSTREAM-CANDIDATES.md), and null again at d65536/d131072 with
+#           llama-bench. The sparse path carries our attention at every depth.
+#           Kept as harmless; first to drop if it ever conflicts.
 # Candidates not yet taken: 27210 (adaptive MTP draft depth) conflicts with 28473
 # in common/speculative.cpp and needs spec-draft-n-max >= 7 (we run 5), so it is
 # a retune, not a drop-in. 25592 (hybrid checkpoint validity) rewrites the same
