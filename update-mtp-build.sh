@@ -36,10 +36,6 @@ PR_REF="refs/pr/${PR}"
 #   28330 - the indexer KV cache allocates a V half it never reads. Four lines, and
 #           at our 131072 ctx it hands back 408 MiB (612 -> 204 MiB) against a
 #           model+KV budget that already runs close to the 128 GB ceiling.
-#   28302 - create_checkpoint()'s spacing eviction deletes the n_tokens-4 checkpoint
-#           on any prompt shorter than checkpoint_min_step (8192), which is the same
-#           failure patches/0001 works around from the other end. Different function,
-#           no overlap with the patch.
 #   28473 - fixes draft-mtp cross-slot content contamination with --parallel > 1
 #           (upstream issue #28286). samm-mbp.ini runs parallel auto (4 slots), so
 #           this is a correctness fix, not a speed one. Output stays plausible when
@@ -79,7 +75,7 @@ PR_REF="refs/pr/${PR}"
 # half-tile skip) - costs 4.1% prefill and 5.1% decode here, reproducibly. 28118
 # (on-device speculative checkpoints) - null on Metal and it aborts the server on
 # the first cached follow-up. See QWEN_NEXT.md.
-EXTRA_PRS=(28022 28232 28092 25788 28330 28302 28473 28333 28305 28439)
+EXTRA_PRS=(28022 28232 28092 25788 28330 28473 28333 28305 28439)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {
