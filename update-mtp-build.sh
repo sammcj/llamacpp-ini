@@ -28,14 +28,6 @@ PR_REF="refs/pr/${PR}"
 #   28092 - --cache-disk: the prompt cache persists to disk and reloads on start,
 #           covering the case #28022 does not - a restart or reboot, which is what
 #           every rebuild of this worktree causes.
-#   25788 - Metal gated_delta_net cache fusion, mirroring the CUDA path: the kernel
-#           writes recurrent-state snapshots straight into the KV cache instead of a
-#           per-layer cpy. 36 of our 48 trunk layers are GDN. Superseded upstream by
-#           ggerganov's #28164, which absorbs it into a single-source fusion table;
-#           swap to that one once it merges.
-#   28330 - the indexer KV cache allocates a V half it never reads. Four lines, and
-#           at our 131072 ctx it hands back 408 MiB (612 -> 204 MiB) against a
-#           model+KV budget that already runs close to the 128 GB ceiling.
 #   28473 - fixes draft-mtp cross-slot content contamination with --parallel > 1
 #           (upstream issue #28286). samm-mbp.ini runs parallel auto (4 slots), so
 #           this is a correctness fix, not a speed one. Output stays plausible when
@@ -58,16 +50,42 @@ PR_REF="refs/pr/${PR}"
 #           UPSTREAM-CANDIDATES.md), and null again at d65536/d131072 with
 #           llama-bench. The sparse path carries our attention at every depth.
 #           Kept as harmless; first to drop if it ever conflicts.
+#   28007 - falls back to full reprocessing when hybrid seq_rm refuses a rollback
+#           past the RS ring instead of aborting the server (upstream issue #27931).
+#           13 lines, safety only.
+#   28785 - ggml-cpu skips the threadpool wake-up when the graph has no CPU work,
+#           which is every graph at -ngl 999. ggml-cpu.c only. Measured 2026-09-13
+#           as part of the four-PR arm: null on short decode (57.2 vs 56.7-57.4)
+#           and on cold prefill (777.9 vs 783.2 tok/s). Kept as harmless.
+#   27694 - probabilistic drafter with rejection sampling for draft-mtp, opt-in via
+#           --spec-draft-sampling probabilistic (set per-model in samm-mbp.ini).
+#           Lossless on the output distribution. Three paired runs at temp 1.0:
+#           acceptance 0.698 -> 0.735, mean len 3.50 -> 3.55, tg +1.2%. Small
+#           because p-min 0.7 already cuts the chain. Conflicts with 28473 in
+#           common/speculative.cpp (one hunk, rerere-resolved).
+#   28699 - incremental pooled-key cache for the QSA indexer via set_rows, so each
+#           QSA layer stops regathering the whole context per decoded token. The
+#           largest decode win in this file. Same-binary A/B via its kill switch
+#           LLAMA_QSA_NO_POOLED_CACHE=1, llama-bench tg32: 34.8 -> 40.3 at d32768
+#           (+16%), 28.1 -> 37.6 at d65536 (+34%); MTP decode at 37k depth 53.0 ->
+#           57.4 t/s (+8%); cold prefill and 4k decode null; greedy output at 32k
+#           depth identical. Draft PR with an open n_dirty assert on image input,
+#           which text-only serving never hits.
 # Candidates not yet taken: 27210 (adaptive MTP draft depth) conflicts with 28473
 # in common/speculative.cpp and needs spec-draft-n-max >= 7 (we run 5), so it is
 # a retune, not a drop-in. 25592 (hybrid checkpoint validity) rewrites the same
 # checkpoint-selection predicate 28092 does; semantic conflict, parked.
 # Merged upstream, so they now arrive through origin/master and are no longer
 # listed: 27941 (qwen4exp follow-up fixes) and 28121 (ssm_a/ggml_scan flag), both
-# squash-merged 2026-09-01. A squash lands the code under a new SHA, so the
-# ancestry check below never fired for either and they were being re-merged on
-# every run; the GitHub state check is what caught them.
-# Dropped: 27977 (closed upstream). 28136 (--lazy-mode on-direct) - null on Metal
+# squash-merged 2026-09-01; 28330 (indexer KV cache drops its unused V half,
+# 612 -> 204 MiB at 131072 ctx), squash-merged 2026-09-10 as 311d4211b. A squash
+# lands the code under a new SHA, so the ancestry check below never fired for
+# any of them and they were being re-merged on every run; the GitHub state check
+# is what caught them.
+# Dropped: 27977 (closed upstream). 25788 (Metal gated_delta_net cache fusion,
+# closed 2026-09-12): its hunk landed on master through ggerganov's 28164
+# (single-source fusion table, merged 2026-09-11 as a2878d30d), which was never
+# carried here. 28136 (--lazy-mode on-direct) - null on Metal
 # at both a 5K and a 32K prompt, and needs a hand-applied ple_w compile fix every
 # run. 28213 (QSA gather) - the author's +6% at 31k and +50% at 130k are CUDA; on
 # Metal it measured slightly negative to 32k, null at 64k and +1.4% only at 128k,
@@ -75,7 +93,7 @@ PR_REF="refs/pr/${PR}"
 # half-tile skip) - costs 4.1% prefill and 5.1% decode here, reproducibly. 28118
 # (on-device speculative checkpoints) - null on Metal and it aborts the server on
 # the first cached follow-up. See QWEN_NEXT.md.
-EXTRA_PRS=(28022 28232 28092 25788 28330 28473 28333 28305 28439)
+EXTRA_PRS=(28022 28232 28092 28473 28333 28305 28439 28007 28785 27694 28699)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {
@@ -321,8 +339,19 @@ if ssl_prefix="$(brew --prefix openssl@3 2>/dev/null)" && [[ -d "${ssl_prefix}" 
   ssl_opts+=(-DOPENSSL_ROOT_DIR="${ssl_prefix}")
 fi
 
+# The preset points CMAKE_OSX_SYSROOT at CommandLineTools/SDKs/MacOSX.sdk, which
+# a CLT update repointed to a 27.0 SDK on 2026-09-11 while xcode-select still
+# resolves the Xcode ld (ld-1267). That ld rejects the new SDK's tbd files
+# ("unknown architecture: arm64e.x1-macos"). Ask the toolchain xcode-select
+# resolves for its own SDK instead, so ld and SDK always come from the same
+# place.
+sdk_opts=()
+if sdk_path="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null)" && [[ -d "${sdk_path}" ]]; then
+  sdk_opts+=(-DCMAKE_OSX_SYSROOT="${sdk_path}")
+fi
+
 echo "Building llama-server, llama-cli, llama-bench (preset: local)..."
-(cd "${WORKTREE}" && cmake --preset local "${ssl_opts[@]}" >/dev/null) \
+(cd "${WORKTREE}" && cmake --preset local "${ssl_opts[@]}" "${sdk_opts[@]}" >/dev/null) \
   || die "cmake configure failed"
 cmake --build "${WORKTREE}/build" --target llama-server llama-cli llama-bench -j \
   || die "build failed"

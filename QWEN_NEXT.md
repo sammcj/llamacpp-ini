@@ -370,7 +370,7 @@ Consistent direction at both depths with non-overlapping error bars, from separa
 
 No mechanism is claimed. The T(n) fits differ by 0.25 ms/token in slope (5.03 f16 vs 5.28 q8_0), which is tempting to read as flash-attn no longer dequantising KV per token - but that difference is smaller than the +/-11% error bar on the n=1 point inside the same fit, and at n=2 the sign reverses (32.36 q8_0 against 32.57 f16). Establishing the mechanism needs arms 1 and 3 re-run at higher `-r` with per-point error bars.
 
-Only 12 of 48 layers attend, so the memory cost is small. For scale this is a larger win than #28213 (rejected) and roughly half of #25788 (adopted), for a config change rather than a patch.
+Only 12 of 48 layers attend, so the memory cost is small. For scale this is a larger win than #28213 (rejected) and roughly half of #25788 (now on master via #28164), for a config change rather than a patch.
 
 ## Q4_0 draft LM head: rejected on multi-prompt retest (2026-09-02)
 

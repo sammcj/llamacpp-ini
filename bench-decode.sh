@@ -13,6 +13,10 @@ set -euo pipefail
 # proper rejection sampling has something to recover. If it does not, the draft is simply
 # wrong that often and no verification scheme will help.
 #
+# PR #27694 replaces both halves of that with a sampled draft and rejection-sampling
+# verification, opt-in via `--spec-draft-sampling probabilistic`; samm-mbp.ini serves the
+# model that way, so pass it through EXTRA_SERVER_ARGS to bench the served config.
+#
 # Usage: TEMP=1.0 ./bench-decode.sh <label>
 
 LABEL="${1:?usage: bench-decode.sh <label>}"
@@ -54,6 +58,10 @@ if [[ -n "${PREFIX_FILE:-}" ]]; then
   CTX="${CTX_PREFIX:-65536}"
 fi
 
+# EXTRA_SERVER_ARGS appends to the server command line, for flags a PR under test
+# adds (e.g. EXTRA_SERVER_ARGS="--spec-draft-sampling probabilistic" for #27694).
+read -r -a EXTRA <<< "${EXTRA_SERVER_ARGS:-}"
+
 SRV=""
 # shellcheck disable=SC2329  # invoked by the EXIT trap below
 cleanup() { [[ -n "${SRV}" ]] && kill "${SRV}" 2>/dev/null || true; }
@@ -65,7 +73,7 @@ trap cleanup EXIT
   --spec-draft-backend-sampling \
   --temp "${TEMP}" --top-k 20 --min-p 0.0 \
   --reasoning-format deepseek --reasoning-preserve \
-  --chat-template-file "${TEMPLATE}" > "${LOG}" 2>&1 &
+  --chat-template-file "${TEMPLATE}" "${EXTRA[@]}" > "${LOG}" 2>&1 &
 SRV=$!
 
 waited=0
