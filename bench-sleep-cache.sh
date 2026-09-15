@@ -15,7 +15,7 @@ set -euo pipefail
 #
 # The two fixes are opt-in flags, so pass them via EXTRA_ARGS to see them work:
 #   EXTRA_ARGS="--sleep-preserve-cache"                     covers step 3 (PR #28022)
-#   EXTRA_ARGS="--sleep-preserve-cache --cache-disk /path"  covers step 4 too (PR #28092)
+#   EXTRA_ARGS="--sleep-preserve-cache --cache-dir /path"  covers step 4 too (PR #28092)
 #
 # SLEEP_IDLE is deliberately small so the test takes a minute rather than the hour the ini uses.
 #
@@ -69,7 +69,7 @@ start_server() {
 
   # Reported separately from the request timings: restoring the disk cache happens in
   # server_prompt_cache's constructor, before the port opens, so it lands here and not
-  # in the ask() figure below. Without this, --cache-disk looks free at restart.
+  # in the ask() figure below. Without this, --cache-dir looks free at restart.
   t1="${EPOCHREALTIME/,/.}"
   STARTUP="$(awk "BEGIN{printf \"%.1f\", ${t1} - ${t0}}")"
 }

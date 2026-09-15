@@ -125,7 +125,7 @@ class Config:
         metadata={"env": "QWEN_CHAT_TEMPLATE", "conv": Path},
     )
     qwen_template_min: tuple[int, int] = (3, 5)  # lowest Qwen version that gets it
-    # PR #28092's --cache-disk. Written per model rather than once in the launcher,
+    # PR #28092's --cache-dir (named --cache-disk until 2026-09-14). Written per model rather than once in the launcher,
     # because the router renders its own CLI args into every child (server_models
     # builds base_preset from argc/argv) and a child deletes every entry in the
     # directory whose cache key is not its own. One shared path means loading a
@@ -258,8 +258,8 @@ def cache_disk_overrides(name: str, cfg: Config) -> dict[str, str]:
     if not any(m.lower() in name.lower() for m in cfg.cache_disk_models):
         return {}
     return {
-        "cache-disk": str(cfg.cache_disk_dir / name),
-        "cache-disk-max": str(cfg.cache_disk_max_mib),
+        "cache-dir": str(cfg.cache_disk_dir / name),
+        "cache-dir-max": str(cfg.cache_disk_max_mib),
     }
 
 

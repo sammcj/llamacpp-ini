@@ -25,9 +25,14 @@ PR_REF="refs/pr/${PR}"
 #   28232 - truncates speculative results at EOG before rollback, so draft-mtp
 #           stops leaving accepted tokens past the end-of-generation token in the
 #           slot (upstream issue #28049). Retest of an earlier void null.
-#   28092 - --cache-disk: the prompt cache persists to disk and reloads on start,
-#           covering the case #28022 does not - a restart or reboot, which is what
-#           every rebuild of this worktree causes.
+#   28092 - --cache-dir (named --cache-disk until 2026-09-14): the prompt cache
+#           persists to disk and reloads on start, covering the case #28022 does
+#           not - a restart or reboot, which is what every rebuild of this
+#           worktree causes. Its head moves; when it does, the rerere resolution
+#           against 28022 goes stale and the script builds WITHOUT it, which
+#           the router then reports as "option 'cache-dir' not recognized".
+#           Resolve once by hand (keep 28092's disk/RAM split, put 28022's
+#           short-write checks on the RAM branch using discard()).
 #   28473 - fixes draft-mtp cross-slot content contamination with --parallel > 1
 #           (upstream issue #28286). samm-mbp.ini runs parallel auto (4 slots), so
 #           this is a correctness fix, not a speed one. Output stays plausible when

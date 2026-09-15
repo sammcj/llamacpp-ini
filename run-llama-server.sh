@@ -78,12 +78,12 @@ fi
 # longer has to span a working day. An hour frees the ~94 GB over lunch and overnight
 # while keeping the reload rare. LLAMA_SLEEP_IDLE=-1 never sleeps.
 #
-# Note the interaction with the per-model --cache-disk that sync-models.py sets: each
+# Note the interaction with the per-model --cache-dir that sync-models.py sets: each
 # sleep runs every idle slot through prompt_save, so a shorter idle window means more
 # writes - up to ~900 MiB per slot per sleep, several times a day.
 SLEEP_IDLE="${LLAMA_SLEEP_IDLE:-3600}"
 
-# A restart loses the cache outright, since it only ever lived in RAM. --cache-disk
+# A restart loses the cache outright, since it only ever lived in RAM. --cache-dir
 # (PR #28092) fixes that, but it is set per model by sync-models.py rather than here:
 # the router builds its child presets from its own argv, so a path given here would be
 # handed to every child, and a child deletes every entry in its cache directory whose
