@@ -243,7 +243,7 @@ if [[ -n "${dirty}" ]]; then
     echo "  git -C ${WORKTREE} stash push -m 'wip'"
     echo
     echo
-    echo "The two patches this build needs are applied from patches/ automatically;"
+    echo "The local patches this build needs are applied from patches/ automatically;"
     echo "they are not what this is complaining about. If you edited one by hand,"
     echo "regenerate it (see patches/README.md) rather than leaving it in the tree."
   } >&2

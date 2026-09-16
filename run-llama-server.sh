@@ -83,6 +83,13 @@ fi
 # writes - up to ~900 MiB per slot per sleep, several times a day.
 SLEEP_IDLE="${LLAMA_SLEEP_IDLE:-3600}"
 
+# Router-level: how many models stay resident. The router only applies the preset's
+# [*] section to its child processes; its own argv sets this, so it must be passed
+# here rather than in the ini (a models-max key there is silently ignored). One
+# resident model keeps the active one's page cache warm; two big Qwen grafts evict
+# each other and the second load drove free RAM to 1%. LLAMA_MODELS_MAX=0 is unlimited.
+MODELS_MAX="${LLAMA_MODELS_MAX:-1}"
+
 # A restart loses the cache outright, since it only ever lived in RAM. --cache-dir
 # (PR #28092) fixes that, but it is set per model by sync-models.py rather than here:
 # the router builds its child presets from its own argv, so a path given here would be
@@ -103,5 +110,6 @@ exec "${LLAMA_SERVER_BIN}" \
     --host 127.0.0.1 \
     --models-dir "${MODELS_DIR}" \
     --models-preset "${PRESET}" \
+    --models-max "${MODELS_MAX}" \
     "${SLEEP_ARGS[@]}" \
     "$@"
