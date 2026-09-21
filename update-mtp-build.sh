@@ -185,6 +185,34 @@ for i in "${!EXTRA_PRS[@]}"; do
   fi
 done
 
+# samm-mbp.env carries LLAMA_QSA_NO_POOLED_CACHE=1 because 28699's pooled cache
+# aborts with two sequences on the unified cache (bench-slots.sh, 2026-09-22). That
+# was measured at one head; a new head or a merge is the moment to re-run
+# bench-slots.sh without the variable and drop it if the probe passes. Pause here so
+# the reminder is not lost in build output.
+POOLED_PR=28699
+POOLED_PR_BROKEN_HEAD=141f3f564
+if grep -q '^export LLAMA_QSA_NO_POOLED_CACHE=' "${SCRIPT_DIR}/samm-mbp.env" 2>/dev/null; then
+  for i in "${!EXTRA_PRS[@]}"; do
+    [[ "${EXTRA_PRS[$i]}" == "${POOLED_PR}" ]] || continue
+    pooled_state="${extra_states_upstream[$i]:-}"
+    pooled_head="${extra_heads[$i]}"
+    if [[ "${pooled_state}" == "MERGED" || "${pooled_state}" == "CLOSED" \
+          || "${pooled_head}" != "${POOLED_PR_BROKEN_HEAD}"* ]]; then
+      {
+        echo "reminder: PR #${POOLED_PR} is ${pooled_state:-unknown} upstream at ${pooled_head:0:9}"
+        echo "          (kill switch measured against ${POOLED_PR_BROKEN_HEAD}). samm-mbp.env still"
+        echo "          sets LLAMA_QSA_NO_POOLED_CACHE=1. After this build, run bench-slots.sh"
+        echo "          with the variable unset; if both concurrent slots pass, remove it from"
+        echo "          samm-mbp.env and bump POOLED_PR_BROKEN_HEAD here."
+      } >&2
+      if [[ -t 0 ]]; then
+        read -r -p "Enter to keep building, Ctrl-C to stop: " _ || true
+      fi
+    fi
+  done
+fi
+
 if git -C "${REPO}" merge-base --is-ancestor "${PR_REF}" origin/master; then
   echo "PR #${PR} has MERGED upstream."
   echo "Retire this setup: build main as usual, delete the LLAMA_SERVER_BIN"
