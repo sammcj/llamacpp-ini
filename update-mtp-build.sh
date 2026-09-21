@@ -46,15 +46,6 @@ PR_REF="refs/pr/${PR}"
 #           row count varies per verify and can trigger a ggml-alloc realloc; we
 #           run spec-draft-backend-sampling = 1. Measured 2026-09-08 with
 #           bench-decode.sh ABAB: null (tg 57.0/56.9/56.8/56.5). Kept as harmless.
-#   28439 - Metal flash-attn wide query tile (8 -> 16 rows) when ne01 >= 64 and
-#           head size pads to a multiple of 128. Our DK=DV=256 hits the gate. The
-#           author's M5 numbers are -34% at 16K and -47% at 64K KV on hs 256, but
-#           the vec and sparse paths are untouched, so the sparse-FA QSA layers
-#           gain nothing and attention is ~5% of prefill here. Measured as part of
-#           the four-PR arm 2026-09-08: null at 33k cold prefill (see
-#           UPSTREAM-CANDIDATES.md), and null again at d65536/d131072 with
-#           llama-bench. The sparse path carries our attention at every depth.
-#           Kept as harmless; first to drop if it ever conflicts.
 #   28007 - falls back to full reprocessing when hybrid seq_rm refuses a rollback
 #           past the RS ring instead of aborting the server (upstream issue #27931).
 #           13 lines, safety only.
@@ -76,6 +67,15 @@ PR_REF="refs/pr/${PR}"
 #           57.4 t/s (+8%); cold prefill and 4k decode null; greedy output at 32k
 #           depth identical. Draft PR with an open n_dirty assert on image input,
 #           which text-only serving never hits.
+#   29166 - set_input_qsa's per-block bias path indexed bid_cell/bid_idx by block
+#           number instead of bid; the two only coincide with one sequence in a
+#           unified cache. We run 4 slots on one unified cache with blk_bias on,
+#           so with two live slots a block can read another sequence's bias and
+#           the model stops seeing its latest messages. Correctness, 24 lines.
+#           Conflicts with 28699 in llama-memory-hybrid-idx.cpp (rerere-resolved).
+#   29075 - Metal fa-vec tuned table keyed by GPU family instead of SKU, so an
+#           M5 Max without its own row takes the family entry rather than the
+#           untuned default. Approved upstream; drop once it lands.
 # Candidates not yet taken: 27210 (adaptive MTP draft depth) conflicts with 28473
 # in common/speculative.cpp and needs spec-draft-n-max >= 7 (we run 5), so it is
 # a retune, not a drop-in. 25592 (hybrid checkpoint validity) rewrites the same
@@ -97,8 +97,12 @@ PR_REF="refs/pr/${PR}"
 # so it loses at the depths this machine actually runs. 28301 (Metal mul_mm_id
 # half-tile skip) - costs 4.1% prefill and 5.1% decode here, reproducibly. 28118
 # (on-device speculative checkpoints) - null on Metal and it aborts the server on
-# the first cached follow-up. See QWEN_NEXT.md.
-EXTRA_PRS=(28022 28232 28092 28473 28333 28305 28439 28007 28785 27694 28699)
+# the first cached follow-up. 28439 (Metal flash-attn 16-row query tile, dropped
+# 2026-09-22) - null at 33k cold prefill and at d65536/d131072 because the sparse
+# path carries our attention; its fa_pick table keys on ggml_metal_device_id via
+# an include that 29075 removes from ggml-metal-tuning.h, so the two do not
+# compile together. See QWEN_NEXT.md.
+EXTRA_PRS=(28022 28232 28092 28473 28333 28305 28007 28785 27694 28699 29166 29075)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {
