@@ -49,7 +49,7 @@ PR_REF="refs/pr/${PR}"
 #   28439 - Metal flash-attn wide query tile (8 -> 16 rows) when ne01 >= 64 and
 #           head size pads to a multiple of 128. Our DK=DV=256 hits the gate. The
 #           author's M5 numbers are -34% at 16K and -47% at 64K KV on hs 256, but
-#           the vec and sparse paths are untouched, so the patches/0002 QSA layers
+#           the vec and sparse paths are untouched, so the sparse-FA QSA layers
 #           gain nothing and attention is ~5% of prefill here. Measured as part of
 #           the four-PR arm 2026-09-08: null at 33k cold prefill (see
 #           UPSTREAM-CANDIDATES.md), and null again at d65536/d131072 with
@@ -317,9 +317,9 @@ done
 
 # Local patches, applied after the merges and before the build. checkout -B above
 # rebuilds the branch from the PR head every run, so these cannot be carried as
-# working-tree edits or stashes - one of them is the difference between a build that
-# compiles on macOS and one that does not, and the other is a silent 8x. --3way lets
-# them survive upstream moving the surrounding code. See patches/README.md.
+# working-tree edits or stashes - one is a silent 8x on cached turns, the other is
+# the difference between the MTP graph loading and aborting. --3way lets them
+# survive upstream moving the surrounding code. See patches/README.md.
 for patch in "${patches[@]}"; do
   git -C "${WORKTREE}" apply --3way "${patch}" \
     || die "local patch $(basename "${patch}") no longer applies; fix it before building"
