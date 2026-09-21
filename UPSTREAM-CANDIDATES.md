@@ -201,3 +201,26 @@ Not worth chasing: **#27441** (Metal skinny-batch mul_mm, big M4 Max numbers but
 One non-PR finding from the #28243 thread (ovidiu-morar, M5 Pro): greedy divergence at n-max >= 3 traces to `mul_mv_ext` reduction width changing with `ne11`, which explains temp-0 non-identity between MTP and non-MTP runs. See the `mul_mv_ext` section above.
 
 **2026-09-15 follow-up.** #28092 moved its head (`f2431a23a`) and renamed the flags to `--cache-dir` / `--cache-dir-max`; the stale rerere record made the script build without it and the router failed with "option 'cache-disk' not recognized". Master (`4c9233c03`, #28896 reshapes the hc/ple norm tensors for rms_norm+mul fusion) also stopped merging onto the PR head. Both re-resolved by hand and recorded, `sync-models.py` and `samm-mbp.ini` now emit the new key names, router starts.
+
+### Upstream scan 2026-09-22
+
+Local patch 0002 retired: **#28770** (merged 2026-09-20 as `3cf03257f`) uncommented the sparse-FA line itself. All twelve carried PRs still open; no merges or closures.
+
+Worth taking:
+
+- **[#29166](https://github.com/ggml-org/llama.cpp/pull/29166)** (draft, 24 lines, `llama-memory-hybrid-idx.cpp`) - fixes `set_input_qsa`'s per-block bias path indexing `bid_cell`/`bid_idx` by block number instead of bid, which only coincide with one sequence in a unified cache. We run qwen4exp with `parallel` auto (4 slots, `kv_unified`) and `blk_bias` is on for causal text, so this is our configuration exactly; the author's repro is two live slots where the model stops seeing its latest messages. Conflicts with #28699 in the same file; one hand resolve, then rerere carries it. Correctness, not speed.
+
+Watch, arrives via master or not applicable yet:
+
+- **[#29075](https://github.com/ggml-org/llama.cpp/pull/29075)** (approved) - rekeys the Metal fa-vec tuned table by GPU family instead of SKU. Lands on its own; worth a decode A/B after the next master merge in case the M5 Max SKU had no row.
+- **[#29110](https://github.com/ggml-org/llama.cpp/pull/29110)** - multi-column `mul_mv` kernels for ne11 2..8, the exact `mul_mv_ext` cost the section above documents (the author measures verify at n_max 2 costing as much as generation). Q4_0/Q8_0 only; our weights are IQ4_NL/IQ3_S, so nothing to gain until IQ4_NL is covered.
+- **[#28992](https://github.com/ggml-org/llama.cpp/pull/28992)** - `get_available_slot()` skips the prompt-cache lookup when `f_keep >= 0.5` even though another cached prompt is a better prefix, and divides by zero on an empty slot. Multi-slot agent traffic is where it bites. Conflicts in `server-task.cpp`/`.h`; needs a rebase before it can be carried.
+
+Not taken:
+
+- **#28873** (PARTIAL_ONLY in `llama_kv_cache::state_write`) - `llama_memory_hybrid_idx` already gates its KV child on the flag, and both target and MTP head are hybrid_idx, so a no-op here.
+- **#29208** (clamp draft ctx to `n_ctx_train` under unified KV) - our ctx-size 153600 is under the trained length; no-op.
+- **#29019** (batch order for speculative layer inputs) - the reorder only happens with separate KV streams; we run unified.
+- **#29030** (lazy-tensor direct reads) - reimplements #28136, which measured null on Metal at 5K and 32K.
+- **#26827** (serialise MTP multi-ubatch decode) - CUDA tensor-split host lock; single-device Metal does not queue two graphs.
+- **#26004** (checkpoints across slot save/restore) - slot save/restore is not in use here.
