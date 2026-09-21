@@ -1,0 +1,33 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 02d89c855..c7a1e39d9 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1801,9 +1801,16 @@ private:
+             // cache prompts only for completion tasks
+             const bool can_cache = prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+ 
++            const bool needs_checkpoint =
++                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
++                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
++                n_swa > 0;
++
+             // the checks above only tell if the outgoing state is worth saving
+             // the cache can still hold a better start for this task, so ask it
+-            update_cache = can_cache && (update_cache || prompt_cache->has_better(ret->prompt, task.tokens));
++            update_cache = can_cache && (update_cache || prompt_cache->has_better(
++                ret->prompt, task.tokens, ret->ctx_tgt, ret->id,
++                task.params.cache_prompt, needs_checkpoint, n_swa, slot_prompt_similarity));
+ 
+             if (update_cache) {
+                 SRV_TRC("%s", "updating prompt cache\n");
+@@ -1812,10 +1819,6 @@ private:
+ 
+                 ret->prompt_save(*prompt_cache);
+ 
+-                const bool needs_checkpoint =
+-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
+-                    n_swa > 0;
+                 if (!ret->prompt_load(
+                         *prompt_cache,
+                         task.tokens,

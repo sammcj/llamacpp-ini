@@ -6,6 +6,9 @@ Regenerate after changing them by hand:
 
     git -C ~/git/llama.cpp-pr27836 diff -- tools/server/server-context.cpp > patches/0001-server-context-local.patch
     git -C ~/git/llama.cpp-pr27836 diff -- src/models/qwen4exp.cpp > patches/0003-qwen4exp-mtp-hc-head-norm-shape.patch
+    git -C ~/git/llama.cpp-pr27836 diff -- tools/server/server-context.cpp > patches/0004-server-context-has-better-args.patch
+
+0001 and 0004 both touch `tools/server/server-context.cpp`; regenerate them one hunk at a time (stage the other first, then `git diff` gives only the unstaged hunk).
 
 ## 0001-server-context-local.patch
 
@@ -24,3 +27,9 @@ Passed `top_k->ne[0]` as `n_kv_max` to `build_attn_mha` in `src/models/qwen4exp.
 One line, in `src/models/qwen4exp.cpp`.
 
 **MTP head norm shape after upstream #28896.** Upstream [#28896](https://github.com/ggml-org/llama.cpp/pull/28896) (merged 2026-09-16) changed the trunk's hyper-connection gammas (`hc_attn_norm`, `hc_ffn_norm`, `hc_head_norm`) from flat `{hc_dim}` to `{n_embd, hc}` with `TENSOR_ALLOW_RESHAPE`, so `build_hc_mix` can multiply the 3D `[n_embd, hc, T]` stream directly and fuse rms_norm + mul. PR #27836's `nextn.hc_head_norm` is created by its own code and stayed `{hc_dim}`, so the MTP graph aborts at context creation with `GGML_ASSERT(ggml_can_repeat(b, a))` inside `build_hc_mix`. This patch creates it as `{n_embd, hc}` to match. `nextn.hnorm` stays flat: the MTP graph reshapes to 2D before that multiply. Drop this patch once #27836 rebases past #28896.
+
+## 0004-server-context-has-better-args.patch
+
+One hunk, in `tools/server/server-context.cpp`, needed only while #28992 is carried.
+
+**Pass #28092's arguments to `has_better()`.** #28992 splits the prompt-cache search out of `load()` and asks it from `get_available_slot()` before deciding whether to touch the cache. In our tree `load()` carries #28092's extra parameters (`ctx_tgt`, `id_slot`, `cache_prompt`, `needs_checkpoint`, `n_swa`, `slot_prompt_similarity`) because the disk entries need them for checkpoint admissibility, so `find_better()`/`has_better()` take the same set. The `server-task.*` half of that lives in a rerere resolution; this hunk is the call site, which git auto-merges to the PR's two-argument form and which rerere therefore cannot carry. It hoists `needs_checkpoint` above the call and passes what `prompt_load()` passes. Drop with #28992, or when #28992 rebases onto #28092.

@@ -214,7 +214,7 @@ Worth taking:
 Watch, not applicable yet:
 
 - **[#29110](https://github.com/ggml-org/llama.cpp/pull/29110)** - multi-column `mul_mv` kernels for ne11 2..8, the exact `mul_mv_ext` cost the section above documents (the author measures verify at n_max 2 costing as much as generation). Selected per op on Q4_0/Q8_0 weights, `mul_mat` only. Here that covers the Q8_0 attention projections (9.5% of weights) and none of the IQ3_S/IQ4_NL experts or the PLE table. Partial win bounded by attention's share of decode; A/B once it merges.
-- **[#28992](https://github.com/ggml-org/llama.cpp/pull/28992)** - `get_available_slot()` skips the prompt-cache lookup when `f_keep >= 0.5` even though another cached prompt is a better prefix, and divides by zero on an empty slot. Multi-slot agent traffic is where it bites. Conflicts in `server-task.cpp`/`.h`; needs a rebase before it can be carried.
+- **[#28992](https://github.com/ggml-org/llama.cpp/pull/28992)** - **in the build.** `get_available_slot()` skipped the prompt-cache lookup when `f_keep >= 0.5` even though another cached prompt was a better prefix, and divided by zero on an empty slot. Multi-slot agent traffic is where it bites. Rebased by hand onto #28092's `load()`: `find_better()`/`has_better()` take #28092's extra arguments because the disk entries need `ctx_tgt`/`id_slot`/`n_swa` for checkpoint admissibility. The `server-task.*` half is a rerere resolution; the call site is `patches/0004` because git auto-merges it to the PR's two-argument form. Unmeasured; the shape to test is a second slot holding a shorter prefix of a request the cache has in full.
 
 Not taken:
 

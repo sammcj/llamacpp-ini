@@ -76,6 +76,15 @@ PR_REF="refs/pr/${PR}"
 #   29075 - Metal fa-vec tuned table keyed by GPU family instead of SKU, so an
 #           M5 Max without its own row takes the family entry rather than the
 #           untuned default. Approved upstream; drop once it lands.
+#   28992 - get_available_slot() only consulted the prompt cache when the
+#           outgoing slot state was worth saving (f_keep < 0.5), so a slot
+#           holding a shorter prefix of the request kept it even when the cache
+#           held a longer one, and an empty slot divided by zero. Splits the
+#           search out of load() as find_better()/has_better() and asks the
+#           cache before deciding. Rebased by hand onto 28092's load()
+#           signature (the disk entries need ctx_tgt/id_slot/n_swa for their
+#           checkpoint admissibility), so the has_better call site passes the
+#           same arguments prompt_load does; rerere-resolved in server-task.*.
 # Candidates not yet taken: 27210 (adaptive MTP draft depth) conflicts with 28473
 # in common/speculative.cpp and needs spec-draft-n-max >= 7 (we run 5), so it is
 # a retune, not a drop-in. 25592 (hybrid checkpoint validity) rewrites the same
@@ -102,7 +111,7 @@ PR_REF="refs/pr/${PR}"
 # path carries our attention; its fa_pick table keys on ggml_metal_device_id via
 # an include that 29075 removes from ggml-metal-tuning.h, so the two do not
 # compile together. See QWEN_NEXT.md.
-EXTRA_PRS=(28022 28232 28092 28473 28333 28305 28007 28785 27694 28699 29166 29075)
+EXTRA_PRS=(28022 28232 28092 28473 28333 28305 28007 28785 27694 28699 29166 29075 28992)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {
