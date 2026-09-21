@@ -67,12 +67,6 @@ PR_REF="refs/pr/${PR}"
 #           57.4 t/s (+8%); cold prefill and 4k decode null; greedy output at 32k
 #           depth identical. Draft PR with an open n_dirty assert on image input,
 #           which text-only serving never hits.
-#   29166 - set_input_qsa's per-block bias path indexed bid_cell/bid_idx by block
-#           number instead of bid; the two only coincide with one sequence in a
-#           unified cache. We run 4 slots on one unified cache with blk_bias on,
-#           so with two live slots a block can read another sequence's bias and
-#           the model stops seeing its latest messages. Correctness, 24 lines.
-#           Conflicts with 28699 in llama-memory-hybrid-idx.cpp (rerere-resolved).
 #   29075 - Metal fa-vec tuned table keyed by GPU family instead of SKU, so an
 #           M5 Max without its own row takes the family entry rather than the
 #           untuned default. Approved upstream; drop once it lands.
@@ -110,8 +104,12 @@ PR_REF="refs/pr/${PR}"
 # 2026-09-22) - null at 33k cold prefill and at d65536/d131072 because the sparse
 # path carries our attention; its fa_pick table keys on ggml_metal_device_id via
 # an include that 29075 removes from ggml-metal-tuning.h, so the two do not
-# compile together. See QWEN_NEXT.md.
-EXTRA_PRS=(28022 28232 28092 28473 28333 28305 28007 28785 27694 28699 29166 29075 28992)
+# compile together. 29166 (QSA per-block bias with several sequences, dropped
+# 2026-09-22 the same day it went in): bench-slots.sh bisected it as the cause of
+# garbled replies when two slots run concurrently on the unified cache (PR+master
+# and PR+28699 pass the probe, adding 29166 fails it), and the symptom it claims
+# to fix does not reproduce here without it. See QWEN_NEXT.md.
+EXTRA_PRS=(28022 28232 28092 28473 28333 28305 28007 28785 27694 28699 29075 28992)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {

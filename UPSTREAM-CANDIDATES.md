@@ -208,7 +208,7 @@ Local patch 0002 retired: **#28770** (merged 2026-09-20 as `3cf03257f`) uncommen
 
 Worth taking:
 
-- **[#29166](https://github.com/ggml-org/llama.cpp/pull/29166)** (draft, 24 lines, `llama-memory-hybrid-idx.cpp`) - **in the build.** Fixes `set_input_qsa`'s per-block bias path indexing `bid_cell`/`bid_idx` by block number instead of bid, which only coincide with one sequence in a unified cache. We run qwen4exp with `parallel` auto (4 slots, `kv_unified`) and `blk_bias` is on for causal text, so this is our configuration exactly; the author's repro is two live slots where the model stops seeing its latest messages. Conflicted with #28699 at the same insertion point (both blocks kept, rerere-resolved). Correctness, not speed.
+- **[#29166](https://github.com/ggml-org/llama.cpp/pull/29166)** (draft, 24 lines, `llama-memory-hybrid-idx.cpp`) - **taken then dropped the same day.** Claims to fix `set_input_qsa`'s per-block bias path with several sequences in a unified cache, which is our serving shape (4 slots, `kv_unified`). `bench-slots.sh` (written for this) says the opposite: two concurrent 10k-token requests with a codeword at the end of each prompt both answer correctly on current master, on PR #27836 + master, and on PR + #28699 with the pooled cache off; adding #29166 makes both replies wrong ("PEL" for PELICAN, a rambling deduction for OSPREY) with speculation on or off and with the base or merged GGUF. Its inverse block map is keyed on the stream's first sequence, and with unified KV a ubatch carries tokens from several sequences, so the other sequences read the wrong entry. Worth reporting on the PR with the probe.
 - **[#29075](https://github.com/ggml-org/llama.cpp/pull/29075)** (approved) - **in the build.** Rekeys the Metal fa-vec tuned table by GPU family instead of SKU, so an M5 Max without its own row takes the family entry. Does not compile alongside #28439: its `fa_pick` table keys on `ggml_metal_device_id` through the `ggml-metal-device.h` include that 29075 removes from `ggml-metal-tuning.h`. #28439 was null twice and documented as first to drop, so it is dropped. `bench-decode.sh` at temp 1.0 on the new build: 73.0 / 56.4 / 65.3, mean **64.9 t/s**, acceptance 0.731, mean len 3.70, against 57.5-57.9 on 2026-09-13 with the same acceptance (0.735) - so the +12% is kernel-side, not drafting. Not attributable without an ABAB rebuild: master since 13 Sep also brought the Metal MoE/SSM_CONV fusions (#28948), qwen4exp hc ops (#29000) and rms_norm+mul fusion (#28896).
 
 Watch, not applicable yet:
@@ -224,3 +224,19 @@ Not taken:
 - **#29030** (lazy-tensor direct reads) - reimplements #28136, which measured null on Metal at 5K and 32K.
 - **#26827** (serialise MTP multi-ubatch decode) - CUDA tensor-split host lock; single-device Metal does not queue two graphs.
 - **#26004** (checkpoints across slot save/restore) - slot save/restore is not in use here.
+
+**Multi-slot probe, 2026-09-22.** `bench-slots.sh` runs two concurrent 10k-token requests on the served shape (4 slots, unified KV) with a codeword at the end of each prompt, then three pinned requests for the #28992 cache-lookup case. Runs with the pooled cache off unless noted:
+
+| build | concurrent A | concurrent B |
+|---|---|---|
+| master `58367713a`, base GGUF, no spec | ok | ok |
+| PR #27836 + master | ok | ok |
+| PR + #28699 | ok | ok |
+| PR + #28699 + #29166 | wrong | wrong |
+| full stack with #29166 | wrong | wrong |
+| full stack without #29166 | ok | ok |
+| full stack without #29166, pooled cache ON | abort | abort |
+
+Two findings. First, #29166 is the cause of the garbled replies and is dropped. Second, **#28699 aborts the server the moment two sequences are live on one unified stream** (`llama-memory-hybrid-idx.cpp:706`, `n_dirty <= n_dirty_max`): `set_input_qsa` takes `n_complete` from the last bid of every sequence in the stream while `qsa_pooled_n_dirty_max` sizes the table from this ubatch's own positions, and beyond the assert the pooled rows are one per position block per stream with a per-sequence watermark, so two sequences would share rows. It is single-sequence-per-stream by design. The served config has been exposed to this since 2026-09-13; nothing hit it because no two long requests overlapped. `LLAMA_QSA_NO_POOLED_CACHE=1` in `samm-mbp.env` is the immediate mitigation and costs #28699's gain (+16% tg at d32768, +34% at d65536, +8% MTP decode at 37k); the alternatives are serving without `kv_unified` (ctx-size becomes per slot), `parallel = 1`, or making the pooled cache per sequence.
+
+#28992 confirmed on the same run: the third request, landing on a slot that held a 1385-token prefix of its 10727-token prompt, prefilled 4 tokens in 95 ms instead of the ~9.3k the old `f_keep` gate would have reprocessed.
