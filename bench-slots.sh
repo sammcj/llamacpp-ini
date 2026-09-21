@@ -19,7 +19,18 @@ set -euo pipefail
 # Usage: ./bench-slots.sh <label>
 
 LABEL="${1:?usage: bench-slots.sh <label>}"
-BIN="${SERVER_BIN:-/Users/samm/git/llama.cpp-pr27836/build/bin/llama-server}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Same per-host env the launcher sources, so the server here runs with the served
+# kill switches (LLAMA_QSA_NO_POOLED_CACHE for #28699). Without it the pooled cache
+# aborts at the concurrent step, which is the bug the variable exists for.
+HOST_ENV="${SCRIPT_DIR}/$(hostname -s).env"
+if [[ -f "${HOST_ENV}" ]]; then
+  # shellcheck source=/dev/null
+  source "${HOST_ENV}"
+fi
+
+BIN="${SERVER_BIN:-${LLAMA_SERVER_BIN:-/Users/samm/git/llama.cpp-pr27836/build/bin/llama-server}}"
 MODEL="${MTP_MODEL:-${HOME}/git/sammcj/llamacpp-ini/models/Qwen3.8-Flash-Next-MTP-Merged-GGUF/Qwen3.8-Flash-Next-MTP-UD-IQ4_XS-00001-of-00004.gguf}"
 TEMPLATE="${HOME}/git/Qwen-Fixed-Chat-Templates/chat_template.jinja"
 OUT="/tmp/claude/slots-${LABEL}.txt"
@@ -86,7 +97,7 @@ ask() {
 }
 
 {
-  echo "slots  ${LABEL}  $(date '+%Y-%m-%d %H:%M')"
+  echo "slots  ${LABEL}  $(date '+%Y-%m-%d %H:%M')  bin=${BIN##*/}  pooled_cache=$([[ -n "${LLAMA_QSA_NO_POOLED_CACHE:-}" ]] && echo off || echo on)"
   echo
   echo "A. concurrent slots, #29166"
 } | tee "${OUT}"
