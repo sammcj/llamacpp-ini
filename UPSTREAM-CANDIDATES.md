@@ -240,3 +240,24 @@ Not taken:
 Two findings. First, #29166 is the cause of the garbled replies and is dropped. Second, **#28699 aborts the server the moment two sequences are live on one unified stream** (`llama-memory-hybrid-idx.cpp:706`, `n_dirty <= n_dirty_max`): `set_input_qsa` takes `n_complete` from the last bid of every sequence in the stream while `qsa_pooled_n_dirty_max` sizes the table from this ubatch's own positions, and beyond the assert the pooled rows are one per position block per stream with a per-sequence watermark, so two sequences would share rows. It is single-sequence-per-stream by design. The served config has been exposed to this since 2026-09-13; nothing hit it because no two long requests overlapped. `LLAMA_QSA_NO_POOLED_CACHE=1` in `samm-mbp.env` is the immediate mitigation and costs #28699's gain (+16% tg at d32768, +34% at d65536, +8% MTP decode at 37k); the alternatives are serving without `kv_unified` (ctx-size becomes per slot), `parallel = 1`, or making the pooled cache per sequence.
 
 #28992 confirmed on the same run: the third request, landing on a slot that held a 1385-token prefix of its 10727-token prompt, prefilled 4 tokens in 95 ms instead of the ~9.3k the old `f_keep` gate would have reprocessed.
+
+### Upstream scan 2026-09-28
+
+**#29075** merged 2026-09-23, dropped from `EXTRA_PRS`. The other eleven carried PRs are open with unchanged heads; none superseded or rejected. Master since 09-22 also brought Metal sparse-FA optimisation (#29377) and graph-capture fix (#29390).
+
+Worth taking:
+
+- **[#29370](https://github.com/ggml-org/llama.cpp/pull/29370)** - **in the build.** `ggml-alloc` reuses a stale plan when a tensor's output flag changes; `build_sampling()` hits it whenever the set of active samplers changes, so with backend sampling and several slots the draft candidates get corrupted (issue #29313, EAGLE-3 acceptance 0.024 -> 0.112). We run `spec-draft-backend-sampling = 1` with 4 slots. Author states #28305 alone does not fix it and the two merge cleanly. Merged clean; `bench-slots.sh` passes 3/3 plus the #28992 case. Acceptance under concurrency unmeasured.
+
+Tried and dropped:
+
+- **#28699 per-sequence pooled rows** (akionux's patch in a #28699 comment, 2026-09-20). Removes the `n_dirty` abort but gives wrong answers instead: with the pooled cache on, `bench-slots.sh` concurrent B fails ("Based on the analysis..." for OSPREY). Its bias hunk (the #29166 change again) also breaks the gather path, failing A and B with the pooled cache off. Scoping that hunk to the pooled path and routing multi-sequence ubatches to the gather fixed the gather path but not the pooled one. The pooled path still maps cells to blocks by bid (`cur_cell_blk`, `dead_bid = n_bid`), and in a unified stream with interleaved sequences a bid is not a position block, so the patch's per-sequence rows are read through the wrong index. Fixing that is a rework of #28699's block mapping. `LLAMA_QSA_NO_POOLED_CACHE=1` stays.
+
+Watch:
+
+- **[#28243](https://github.com/ggml-org/llama.cpp/pull/28243)** (danielhanchen) - Qwen3.8-Flash-Next MTP built on #27836 plus shared embeddings/lm head and draft-only GGUF loading. Maintained (merged master 09-21) while #27836 has not moved since 08-27; the likelier merge vehicle, so a possible base swap.
+- **[#29385](https://github.com/ggml-org/llama.cpp/pull/29385)** (ngxson, ggerganov testing) - migrates speculative and server to `batch_ext`. Expect rerere breakage in `common/speculative.cpp` and `server-context.cpp` (#28473, #27694, #28232, patches) when it lands.
+- **[#29408](https://github.com/ggml-org/llama.cpp/pull/29408)** - competing fix for the sleep cache loss #28022 covers.
+- **[#29463](https://github.com/ggml-org/llama.cpp/pull/29463)** - `LLAMA_CKPT_OFFSETS` env var; would replace the hardcoded offsets in `patches/0001` if it merges.
+
+Not taken: **#29509** (draft KV out of checkpoints, no-op because the MTP head is hybrid_idx); **#29340** (Metal FA smem overflow at DK 512/576, ours is 256); **#28439** rebased, still SKU-keyed M5 rows only, previously null; **#29355** (single-slot only, ROCm draft model); **#28751** (vision-only path, touches `qwen4exp.cpp` next to #28699); **#29520** (Vulkan only).

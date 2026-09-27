@@ -67,9 +67,6 @@ PR_REF="refs/pr/${PR}"
 #           57.4 t/s (+8%); cold prefill and 4k decode null; greedy output at 32k
 #           depth identical. Draft PR with an open n_dirty assert on image input,
 #           which text-only serving never hits.
-#   29075 - Metal fa-vec tuned table keyed by GPU family instead of SKU, so an
-#           M5 Max without its own row takes the family entry rather than the
-#           untuned default. Approved upstream; drop once it lands.
 #   28992 - get_available_slot() only consulted the prompt cache when the
 #           outgoing slot state was worth saving (f_keep < 0.5), so a slot
 #           holding a shorter prefix of the request kept it even when the cache
@@ -79,6 +76,11 @@ PR_REF="refs/pr/${PR}"
 #           signature (the disk entries need ctx_tgt/id_slot/n_swa for their
 #           checkpoint admissibility), so the has_better call site passes the
 #           same arguments prompt_load does; rerere-resolved in server-task.*.
+#   29370 - ggml-alloc re-plans when a tensor's input/output flag changes, and
+#           build_sampling() marks inactive samplers as outputs too. Without it the
+#           allocator reuses a stale plan whenever the set of sampling slots
+#           changes, corrupting draft candidates under backend sampling with
+#           several slots (issue #29313). 28305 alone does not fix it.
 # Candidates not yet taken: 27210 (adaptive MTP draft depth) conflicts with 28473
 # in common/speculative.cpp and needs spec-draft-n-max >= 7 (we run 5), so it is
 # a retune, not a drop-in. 25592 (hybrid checkpoint validity) rewrites the same
@@ -86,7 +88,8 @@ PR_REF="refs/pr/${PR}"
 # Merged upstream, so they now arrive through origin/master and are no longer
 # listed: 27941 (qwen4exp follow-up fixes) and 28121 (ssm_a/ggml_scan flag), both
 # squash-merged 2026-09-01; 28330 (indexer KV cache drops its unused V half,
-# 612 -> 204 MiB at 131072 ctx), squash-merged 2026-09-10 as 311d4211b. A squash
+# 612 -> 204 MiB at 131072 ctx), squash-merged 2026-09-10 as 311d4211b; 29075
+# (Metal fa-vec tuned table keyed by GPU family), merged 2026-09-23. A squash
 # lands the code under a new SHA, so the ancestry check below never fired for
 # any of them and they were being re-merged on every run; the GitHub state check
 # is what caught them.
@@ -109,7 +112,7 @@ PR_REF="refs/pr/${PR}"
 # garbled replies when two slots run concurrently on the unified cache (PR+master
 # and PR+28699 pass the probe, adding 29166 fails it), and the symptom it claims
 # to fix does not reproduce here without it. See QWEN_NEXT.md.
-EXTRA_PRS=(28022 28232 28092 28473 28333 28305 28007 28785 27694 28699 29075 28992)
+EXTRA_PRS=(28022 28232 28092 28473 28333 28305 28007 28785 27694 28699 28992 29370)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {
