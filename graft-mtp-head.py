@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Graft a standalone Qwen3.8-Flash-Next MTP head GGUF onto an existing split
-quant as an extra split, so llama.cpp PR #27836 (embedded-MTP design) can load it.
+quant as an extra split, so llama.cpp's embedded-MTP loader (#29761) can load it.
 
 Rewrites shard 1 (metadata-only) with block_count+nextn KVs and split.count=4,
 rewrites the head as split 4, and hardlinks the untouched weight shards.
@@ -90,8 +90,12 @@ def main() -> None:
         SPLIT_TENSORS: (n_tensors_total + n_head_tensors, gguf.GGUFValueType.INT32),
     }
     if ratios_field is not None:
+        # the MTP block is a QSA layer (it ships indexer.* tensors); master's converter
+        # writes the full-attention ratio for it, and a 0 here aborts master (#29761)
+        # at MTP context creation with GGML_ASSERT(buffer) on the unused k-pool input
+        ratios = list(ratios_field.contents())
         overrides[f"{arch}.attention.compress_ratios"] = (
-            list(ratios_field.contents()) + [0],
+            ratios + [max(ratios)],
             gguf.GGUFValueType.ARRAY,
         )
 

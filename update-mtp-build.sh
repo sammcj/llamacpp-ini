@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Update the llama.cpp PR #27836 worktree build that serves Qwen3.8-Flash-Next
-# MTP (see QWEN_NEXT.md). Fetches the latest PR head, merges in origin/master
-# so the worktree keeps pace with daily master pulls, rebuilds, and tells you
-# when the PR has merged upstream so the whole arrangement can be retired.
+# Update the llama.cpp worktree build that serves Qwen3.8-Flash-Next MTP (see
+# QWEN_NEXT.md): origin/master plus the open PRs and local patches below, rebuilt
+# without touching the main repo's installed binaries.
+#
+# qwen4exp MTP itself landed on master via #29761 (merged 2026-10-01), which
+# superseded PR #27836, the original base of this worktree. The worktree path
+# still carries the old PR number because samm-mbp.env points LLAMA_SERVER_BIN at it.
 #
 # Usage: ./update-mtp-build.sh    (nothing changed: prompts to rebuild anyway on a
 #                                  terminal, skips silently when non-interactive)
@@ -12,10 +15,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${LLAMA_REPO:-${HOME}/git/llama.cpp}"
 WORKTREE="${LLAMA_MTP_WORKTREE:-${HOME}/git/llama.cpp-pr27836}"
-PR=27836
-BRANCH="pr-${PR}-qwen4exp-mtp"
-PR_REF="refs/pr/${PR}"
-# Extra PRs merged on top of the base, in order. Stacking is NOT free - #27992
+BRANCH="mtp-extras"
+# Extra PRs merged on top of master, in order. Stacking is NOT free - #27992
 # plus #27977 together regressed TG ~18% at 32K - so each entry earns its place
 # with a both-orders A/B before it is added, and the reason lives beside it.
 #   28022 - preserves the prompt cache across an idle sleep. Without it, waking
@@ -37,15 +38,6 @@ PR_REF="refs/pr/${PR}"
 #           (upstream issue #28286). samm-mbp.ini runs parallel auto (4 slots), so
 #           this is a correctness fix, not a speed one. Output stays plausible when
 #           it misfires, which is why nobody noticed.
-#   28333 - zeroes the MTP carrier at sequence start. Without it the carrier
-#           persists between requests and identical deterministic requests can
-#           produce different tokens, which invalidates paired A/B runs against a
-#           long-lived server. Five lines.
-#   28305 - keeps the backend sampling subgraph a fixed shape across ubatches. The
-#           spec-dec verify step samples the whole accepted draft window, so the
-#           row count varies per verify and can trigger a ggml-alloc realloc; we
-#           run spec-draft-backend-sampling = 1. Measured 2026-09-08 with
-#           bench-decode.sh ABAB: null (tg 57.0/56.9/56.8/56.5). Kept as harmless.
 #   28007 - falls back to full reprocessing when hybrid seq_rm refuses a rollback
 #           past the RS ring instead of aborting the server (upstream issue #27931).
 #           13 lines, safety only.
@@ -59,14 +51,6 @@ PR_REF="refs/pr/${PR}"
 #           acceptance 0.698 -> 0.735, mean len 3.50 -> 3.55, tg +1.2%. Small
 #           because p-min 0.7 already cuts the chain. Conflicts with 28473 in
 #           common/speculative.cpp (one hunk, rerere-resolved).
-#   28699 - incremental pooled-key cache for the QSA indexer via set_rows, so each
-#           QSA layer stops regathering the whole context per decoded token. The
-#           largest decode win in this file. Same-binary A/B via its kill switch
-#           LLAMA_QSA_NO_POOLED_CACHE=1, llama-bench tg32: 34.8 -> 40.3 at d32768
-#           (+16%), 28.1 -> 37.6 at d65536 (+34%); MTP decode at 37k depth 53.0 ->
-#           57.4 t/s (+8%); cold prefill and 4k decode null; greedy output at 32k
-#           depth identical. Draft PR with an open n_dirty assert on image input,
-#           which text-only serving never hits.
 #   28992 - get_available_slot() only consulted the prompt cache when the
 #           outgoing slot state was worth saving (f_keep < 0.5), so a slot
 #           holding a shorter prefix of the request kept it even when the cache
@@ -80,7 +64,11 @@ PR_REF="refs/pr/${PR}"
 #           build_sampling() marks inactive samplers as outputs too. Without it the
 #           allocator reuses a stale plan whenever the set of sampling slots
 #           changes, corrupting draft candidates under backend sampling with
-#           several slots (issue #29313). 28305 alone does not fix it.
+#           several slots (issue #29313).
+# Ported rather than merged: 28333 (zeroes the MTP carrier at sequence start, so
+# identical deterministic requests stop diverging against a long-lived server) is
+# patches/0005 because master's batch_ext migration (#29385/#29601) rewrote the
+# lines it touches and the PR has not moved since 2026-09-04.
 # Candidates not yet taken: 27210 (adaptive MTP draft depth) conflicts with 28473
 # in common/speculative.cpp and needs spec-draft-n-max >= 7 (we run 5), so it is
 # a retune, not a drop-in. 25592 (hybrid checkpoint validity) rewrites the same
@@ -112,7 +100,15 @@ PR_REF="refs/pr/${PR}"
 # garbled replies when two slots run concurrently on the unified cache (PR+master
 # and PR+28699 pass the probe, adding 29166 fails it), and the symptom it claims
 # to fix does not reproduce here without it. See QWEN_NEXT.md.
-EXTRA_PRS=(28022 28232 28092 28473 28333 28305 28007 28785 27694 28699 28992 29370)
+# Dropped 2026-10-02 with the move to a master base: 27836 (superseded by #29761).
+# 28305 (static backend sampling subgraph) - measured null on 2026-09-08 and now
+# conflicts with master's rewrite of graph_max_nodes; 29370 is the actual fix for
+# the multi-slot sampling corruption. 28699 (QSA pooled-key cache, +16% tg at
+# d32768 / +34% at d65536) - conflicts with #29761's llama-memory-hybrid-idx and
+# qwen4exp changes, and was already disabled at runtime by LLAMA_QSA_NO_POOLED_CACHE=1
+# because it aborts with two slots on the unified cache. Retake it once it rebases
+# onto master and passes bench-slots.sh.
+EXTRA_PRS=(28022 28232 28092 28473 28007 28785 27694 28992 29370)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {
@@ -140,14 +136,13 @@ pr_state() {
 [[ -d "${REPO}/.git" ]] || die "llama.cpp repo not found at ${REPO}"
 [[ -d "${WORKTREE}" ]] || die "worktree not found at ${WORKTREE} (see QWEN_NEXT.md)"
 
-echo "Fetching origin/master, PR #${PR} and ${#EXTRA_PRS[@]} extra PR(s)..."
-fetch_args=(origin master "+refs/pull/${PR}/head:${PR_REF}")
+echo "Fetching origin/master and ${#EXTRA_PRS[@]} extra PR(s)..."
+fetch_args=(origin master)
 for p in "${EXTRA_PRS[@]}"; do
   fetch_args+=("+refs/pull/${p}/head:refs/pr/${p}")
 done
 git -C "${REPO}" fetch "${fetch_args[@]}"
 
-pr_head="$(git -C "${REPO}" rev-parse "${PR_REF}")"
 master_head="$(git -C "${REPO}" rev-parse origin/master)"
 # Parallel to EXTRA_PRS; indexed arrays rather than an associative one so the
 # ordering stays explicit (merge order changes the result).
@@ -158,26 +153,18 @@ done
 
 # Queried before the already-built skip below, because closing a PR does not move
 # its head - the marker stays valid and a no-op run would otherwise never mention it.
-base_state=""
 extra_states_upstream=()
 closed_prs=()
 if command -v gh >/dev/null 2>&1; then
-  base_state="$(pr_state "${PR}")"
   for p in "${EXTRA_PRS[@]}"; do
     extra_states_upstream+=("$(pr_state "${p}")")
   done
-  if [[ -z "${base_state}" ]]; then
+  if [[ -z "${extra_states_upstream[*]// /}" ]]; then
     echo "warning: could not read PR state from GitHub (gh unauthenticated or offline);" >&2
     echo "         skipping the closed-PR check." >&2
   fi
 else
   echo "note: gh not installed; skipping the closed-PR check." >&2
-fi
-
-if [[ "${base_state}" == "CLOSED" ]]; then
-  echo "warning: PR #${PR} was CLOSED upstream without merging. This whole build" >&2
-  echo "         exists to carry it - check whether it was superseded before you" >&2
-  echo "         keep rebuilding against a dead branch." >&2
 fi
 
 for i in "${!EXTRA_PRS[@]}"; do
@@ -188,56 +175,15 @@ for i in "${!EXTRA_PRS[@]}"; do
   fi
 done
 
-# samm-mbp.env carries LLAMA_QSA_NO_POOLED_CACHE=1 because 28699's pooled cache
-# aborts with two sequences on the unified cache (bench-slots.sh, 2026-09-22). That
-# was measured at one head; a new head or a merge is the moment to re-run
-# bench-slots.sh without the variable and drop it if the probe passes. Pause here so
-# the reminder is not lost in build output.
-POOLED_PR=28699
-POOLED_PR_BROKEN_HEAD=141f3f564
-if grep -q '^export LLAMA_QSA_NO_POOLED_CACHE=' "${SCRIPT_DIR}/samm-mbp.env" 2>/dev/null; then
-  for i in "${!EXTRA_PRS[@]}"; do
-    [[ "${EXTRA_PRS[$i]}" == "${POOLED_PR}" ]] || continue
-    pooled_state="${extra_states_upstream[$i]:-}"
-    pooled_head="${extra_heads[$i]}"
-    if [[ "${pooled_state}" == "MERGED" || "${pooled_state}" == "CLOSED" \
-          || "${pooled_head}" != "${POOLED_PR_BROKEN_HEAD}"* ]]; then
-      {
-        echo "reminder: PR #${POOLED_PR} is ${pooled_state:-unknown} upstream at ${pooled_head:0:9}"
-        echo "          (kill switch measured against ${POOLED_PR_BROKEN_HEAD}). samm-mbp.env still"
-        echo "          sets LLAMA_QSA_NO_POOLED_CACHE=1. After this build, run bench-slots.sh"
-        echo "          with the variable unset; if both concurrent slots pass, remove it from"
-        echo "          samm-mbp.env and bump POOLED_PR_BROKEN_HEAD here."
-      } >&2
-      if [[ -t 0 ]]; then
-        read -r -p "Enter to keep building, Ctrl-C to stop: " _ || true
-      fi
-    fi
-  done
-fi
-
-if git -C "${REPO}" merge-base --is-ancestor "${PR_REF}" origin/master; then
-  echo "PR #${PR} has MERGED upstream."
-  echo "Retire this setup: build main as usual, delete the LLAMA_SERVER_BIN"
-  echo "override in samm-mbp.env, then: git -C ${REPO} worktree remove ${WORKTREE}"
-  exit 0
-fi
-
-if [[ "${base_state}" == "MERGED" ]]; then
-  echo "warning: PR #${PR} shows MERGED upstream but its head is not an ancestor of" >&2
-  echo "         master - a squash or rebase merge. The code is probably in master" >&2
-  echo "         already; check before rebuilding, then retire this setup." >&2
-fi
-
 # The marker records the revisions built plus each extra PR's outcome, so a
 # skipped run can still say the existing binary is missing one.
-marker_key="${pr_head}+${master_head}"
+marker_key="${master_head}"
 for h in "${extra_heads[@]}"; do
   marker_key+="+${h}"
 done
 
 if [[ -f "${MARKER}" ]] && [[ "$(cut -d' ' -f1 "${MARKER}")" == "${marker_key}" ]]; then
-  echo "Already built against this PR head and master."
+  echo "Already built against this master and these PR heads."
   missing="$(cut -d' ' -f2- "${MARKER}" | tr ' ' '\n' | grep ':MISSING$' || true)"
   if [[ -n "${missing}" ]]; then
     echo "warning: that build is MISSING ${missing//:MISSING/}" >&2
@@ -273,7 +219,7 @@ for patch in "${patches[@]}"; do
     || true
 done
 
-# checkout -B rebuilds the branch from the PR head every run, so a tracked file
+# checkout -B rebuilds the branch from master every run, so a tracked file
 # edited by hand (a local compile fix, say) both blocks the checkout with a bare
 # git error and cannot survive anyway. Say which files and how to park them.
 dirty="$(git -C "${WORKTREE}" status --porcelain --untracked-files=no)"
@@ -292,8 +238,10 @@ if [[ -n "${dirty}" ]]; then
   exit 1
 fi
 
-echo "Updating ${BRANCH} to PR head ${pr_head:0:9}..."
-git -C "${WORKTREE}" checkout -q -B "${BRANCH}" "${PR_REF}"
+echo "Updating ${BRANCH} to origin/master ${master_head:0:9}..."
+# --no-track: origin and upstream both map refs/remotes/origin/master in this repo,
+# so the default tracking setup fails as ambiguous. Nothing here pulls the branch.
+git -C "${WORKTREE}" checkout -q --no-track -B "${BRANCH}" "${master_head}"
 
 # Merge a ref, reporting what actually broke. The old version sent conflict
 # output to /dev/null, so a dropped merge looked like a one-line warning with no
@@ -332,8 +280,6 @@ try_merge() {
   return 1
 }
 
-try_merge origin/master "origin/master (${master_head:0:9})" || true
-
 # Ancestry only catches a plain merge upstream; a squash or rebase merge lands
 # the same code under a new SHA and still fails this test, so the merge below is
 # what actually decides.
@@ -358,10 +304,10 @@ for i in "${!EXTRA_PRS[@]}"; do
 done
 
 # Local patches, applied after the merges and before the build. checkout -B above
-# rebuilds the branch from the PR head every run, so these cannot be carried as
-# working-tree edits or stashes - one is a silent 8x on cached turns, the other is
-# the difference between the MTP graph loading and aborting. --3way lets them
-# survive upstream moving the surrounding code. See patches/README.md.
+# rebuilds the branch from master every run, so these cannot be carried as
+# working-tree edits or stashes - 0001 alone is a silent 8x on cached turns.
+# --3way lets them survive upstream moving the surrounding code. See
+# patches/README.md.
 for patch in "${patches[@]}"; do
   git -C "${WORKTREE}" apply --3way "${patch}" \
     || die "local patch $(basename "${patch}") no longer applies; fix it before building"

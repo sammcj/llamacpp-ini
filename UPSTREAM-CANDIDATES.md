@@ -261,3 +261,37 @@ Watch:
 - **[#29463](https://github.com/ggml-org/llama.cpp/pull/29463)** - `LLAMA_CKPT_OFFSETS` env var; would replace the hardcoded offsets in `patches/0001` if it merges.
 
 Not taken: **#29509** (draft KV out of checkpoints, no-op because the MTP head is hybrid_idx); **#29340** (Metal FA smem overflow at DK 512/576, ours is 256); **#28439** rebased, still SKU-keyed M5 rows only, previously null; **#29355** (single-slot only, ROCm draft model); **#28751** (vision-only path, touches `qwen4exp.cpp` next to #28699); **#29520** (Vulkan only).
+
+### Upstream scan 2026-10-02
+
+**[#29761](https://github.com/ggml-org/llama.cpp/pull/29761)** (am17an, "Qwen4Exp: add MTP") merged 2026-10-01 as `c061df198` and supersedes #27836, which had been the worktree's base since 08-29. #28243 and #28097 closed the same day. `update-mtp-build.sh` now builds origin/master plus `EXTRA_PRS` on branch `mtp-extras`; the worktree path keeps its old name because `LLAMA_SERVER_BIN` points at it.
+
+- **Graft fix needed.** #29761 runs the MTP block as a QSA layer, and its converter writes the full-attention compress ratio (4) for it. `graft-mtp-head.py` padded `compress_ratios` with 0 (dense, which is what #27836's hard-dense MTP graph expected). On master that builds the k-pool input without any op reading `k_idxs`, so it is never allocated and the server aborts at MTP context creation with `GGML_ASSERT(buffer)` in `set_input_k_idxs`. The head already carries `blk.48.indexer.*`, so the fix is metadata only: the script now writes `max(ratios)`, and both existing grafts had their shard 1 patched in place (backups in `/tmp/claude/*.bak`, which is cleared on reboot).
+- **Dropped:** #28305 (null, now conflicts with master's `graph_max_nodes` rewrite); #28699 (conflicts with #29761's `llama-memory-hybrid-idx` changes, and was already off at runtime via `LLAMA_QSA_NO_POOLED_CACHE=1`, now removed from `samm-mbp.env`).
+- **Ported:** #28333 as `patches/0005`, after #29385's `batch_ext` migration rewrote its lines. **Retired:** `patches/0003`, since #29761 loads the flat MTP gammas through `TENSOR_ALLOW_RESHAPE`.
+- **Kept, all merging on master:** #28022, #28232, #28092, #28473, #28007, #28785, #27694, #28992, #29370. #28092, #27694 and #28992 replay old rerere resolutions.
+- `bench-slots.sh` passes on the new stack: 3/3 concurrent codewords on 4 unified slots, and #28992's third request prefilled 4 tokens.
+
+Decode on the new stack, same prompts and served flags as the 09-13 table (`--spec-draft-sampling probabilistic`, temp 1.0, n-max 6):
+
+| measure | 09-13/09-22 build | 2026-10-03 |
+|---|---|---|
+| bench-decode.sh 4k, tg t/s | 57.5 / 57.9 / 57.9 | 61.6 |
+| bench-decode.sh 4k, acceptance | 0.735 | 0.712 |
+| bench-decode.sh 37k depth, tg t/s | 53.0 | 58.8 |
+| bench-decode.sh 37k depth, acceptance | - | 0.757 |
+
+The 37k baseline is the served config at the time (pooled cache off). Both decode rows improved even with #28699 gone, so master's own changes since 09-22 (Metal sparse-FA optimisation #29377 and the rest) more than cover it. Acceptance at 4k dipped slightly with the MTP layer now running QSA instead of dense attention. These are single runs across different builds, so read them as direction only.
+
+Cold prefill (`bench-prefill.sh`, 110565 tokens) dropped from 783 tok/s on the 09-13 build. Against a pure-master build of the same commit (`a868c3e3c`, scratch worktree `~/git/llama.cpp-mastertest`), interleaved: ours 697 / 578 / 535 / 706, master 760 / 691 / 765. `mediaanalysisd` was at 117% CPU for the first three runs, and the ABAB pairs waited for it to idle, but per-run spread stayed wide. The best runs give **706 against 765, about -8%**. Per-ubatch times on the 37k prompt match master within about 2% in steady state. The gap is concentrated in the first ubatch (5.7 s against 4.1 s) and an extra ~3 s near the tail. The tail step lines up with `patches/0001`'s 64-token split, but a direct A/B rules that out (below). The remaining gap is unattributed. The suspects are the carried PRs, not the patch.
+
+`patches/0001` re-checked 2026-10-03 on the new stack. Same commit built with and without it, one server per arm, a 15463-token prompt then a second prompt sharing that prefix and diverging in the last line (pinned to one slot):
+
+| arm | cold 15k prefill | diverging turn |
+|---|---|---|
+| without 0001 | 17783 ms | 2044 tok / 2453 ms |
+| with 0001 | 17266 ms | **60 tok / 320 ms** |
+
+7.7x on the diverging turn and no cold-prefill cost, the same picture as under #27836. 0001 stays.
+
+Watch: **[#29825](https://github.com/ggml-org/llama.cpp/pull/29825)** (halves the qwen4exp indexer score memory). #29824 (qwen4exp mask construction) merged 2026-10-02, after this build's master, so the next run picks it up. #29385 merged 09-28 and caused the #28333 port. #29408 and #29463 are still open.
