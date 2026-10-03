@@ -87,7 +87,7 @@ class Config:
 
     # --- MTP / architecture detection ----------------------------------------
     head_max_blocks: int = (
-        8  # nextn tensors + <= this many blocks == head stub, not a model
+        8  # nextn tensors + <= this many distinct blocks == head stub, not a model
     )
     probe_timeout: int = 120  # seconds per llama-gguf probe (it reads headers only)
     diffusion_arch: tuple[str, ...] = (
@@ -95,7 +95,10 @@ class Config:
         "dream",
         "llada",
     )  # only llama-diffusion-cli runs these
-    cache_version: int = 4  # probe-cache schema; bump to invalidate old caches
+    # PrismML ternary quants: only their llama.cpp fork loads these (and the official
+    # llama-gguf aborts on them), so they run via run-llama-server.sh --bonsai.
+    fork_only_quant: str = r"(?i)[._-]P(?:T?Q)[0-9]+_[0-9]+\.gguf$"
+    cache_version: int = 5  # probe-cache schema; bump to invalidate old caches
 
     # --- Size-tier thresholds, in GB (env: SIZE_SMALL_KV_GB / SIZE_CKPT_GB) ---
     # They stack: a model can match more than one tier. See SIZE_TIERS for wiring.
@@ -400,8 +403,9 @@ class Prober:
         if out is None:
             return None
         cnt = sum(1 for ln in out.splitlines() if re.search(r"name = .*nextn", ln))
-        blocks = [int(m) for m in re.findall(r"blk\.(\d+)\.", out)]
-        blk = max(blocks) if blocks else 0
+        # Distinct blocks, not the highest index: a head extracted without
+        # renumbering keeps its layer index (the Qwen3.8-27B head is blk.64 alone).
+        blk = len(set(re.findall(r"blk\.(\d+)\.", out)))
         am = re.search(r"[a-z0-9_-]+\.block_count", out)
         arch = am.group(0)[: -len(".block_count")] if am else ""
         dif = 1 if arch.startswith(self.cfg.diffusion_arch) else 0
@@ -561,6 +565,7 @@ class Sync:
         self.linked = 0
         self.skipped_heads = 0
         self.skipped_dflash = 0
+        self.skipped_fork = 0
         self.nommproj_twins = 0
         self.templated = 0
         self.size_tiered = 0
@@ -574,6 +579,10 @@ class Sync:
         # Unprobed: fall back to the mtp- filename convention rather than assume
         # "not a head" - a head admitted to the farm aborts on load.
         return g.name.startswith("mtp-") and g.name.endswith(".gguf")
+
+    def _is_fork_only(self, g: Path) -> bool:
+        # Filename only: probing would abort in llama-gguf anyway.
+        return re.search(self.cfg.fork_only_quant, g.name) is not None
 
     def _is_diffusion(self, g: Path) -> bool:
         # No filename convention to fall back on; unprobed reads as "not one".
@@ -750,6 +759,8 @@ class Sync:
             b = g.name
             if "mmproj" in b or "-of-" in b:  # mmproj / shards are never heads
                 continue
+            if self._is_fork_only(g):
+                continue
             if self._is_head(g):
                 candidates.setdefault(normalise(b), []).append(g)
         for key, heads in candidates.items():
@@ -781,6 +792,9 @@ class Sync:
     def _process_toplevel(self, ggufs: list[Path]) -> None:
         """Loose *.gguf at the top of the source tree: each is its own model."""
         for g in ggufs:
+            if self._is_fork_only(g):
+                self.skipped_fork += 1
+                continue
             if self._is_head(g):
                 self.skipped_heads += 1
                 continue
@@ -811,6 +825,8 @@ class Sync:
                 shards.append(g)
                 if "-00001-of-" in base:
                     first_shard = g
+            elif self._is_fork_only(g):
+                self.skipped_fork += 1
             elif self._is_head(g):
                 self.skipped_heads += 1
             elif self._is_dflash(g):
@@ -961,6 +977,7 @@ class Sync:
             f"{self.templated} Qwen chat-template fix, "
             f"{self.nommproj_twins} no-mmproj twin(s); skipped {self.skipped_heads} MTP head(s), "
             f"{self.skipped_dflash} DFlash draft(s), "
+            f"{self.skipped_fork} PrismML-fork model(s) (run via --bonsai), "
             f"{len(self.diffusion)} diffusion model(s) (run via llama-diffusion-cli)."
         )
         print(f"router preset: {self.cfg.router_ini}")

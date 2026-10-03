@@ -14,6 +14,8 @@ Needs `llama-server` and `llama-gguf` on PATH, plus Python 3.
 
 Syncs, then starts the router on `127.0.0.1`. `SKIP_SYNC=1` skips the sync; `./sync-models.py` runs it on its own.
 
+`./run-llama-server.sh --bonsai` runs Ternary-Bonsai-2-27B on the PrismML fork (`~/git/llama.cpp-prismml`, override with `PRISMML_SERVER_BIN`) at `127.0.0.1:8081` (`BONSAI_PORT`), beside the router. Its PQ2_0 / PTQ1_0 quants don't load in upstream llama.cpp, so sync keeps them out of the router.
+
 Diffusion models (dream, llada, diffusion-gemma) can't load in llama-server. They're excluded from the router and listed in `.generated/diffusion-models.tsv` for use with `llama-diffusion-cli`.
 
 ## Per-host config
