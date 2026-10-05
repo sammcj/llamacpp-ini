@@ -37,7 +37,11 @@ BRANCH="mtp-extras"
 #   28473 - fixes draft-mtp cross-slot content contamination with --parallel > 1
 #           (upstream issue #28286). samm-mbp.ini runs parallel auto (4 slots), so
 #           this is a correctness fix, not a speed one. Output stays plausible when
-#           it misfires, which is why nobody noticed.
+#           it misfires, which is why nobody noticed. Still in draft upstream.
+#           Conflicts in common/speculative.cpp with 27694's code, which now sits
+#           on master: the conflict is 28473 vs master rather than 28473 vs a PR
+#           head, so the old rerere recording may not replay - if it lands as
+#           MISSING, re-resolve the one hunk by hand once.
 #   28007 - falls back to full reprocessing when hybrid seq_rm refuses a rollback
 #           past the RS ring instead of aborting the server (upstream issue #27931).
 #           13 lines, safety only.
@@ -45,12 +49,6 @@ BRANCH="mtp-extras"
 #           which is every graph at -ngl 999. ggml-cpu.c only. Measured 2026-09-13
 #           as part of the four-PR arm: null on short decode (57.2 vs 56.7-57.4)
 #           and on cold prefill (777.9 vs 783.2 tok/s). Kept as harmless.
-#   27694 - probabilistic drafter with rejection sampling for draft-mtp, opt-in via
-#           --spec-draft-sampling probabilistic (set per-model in samm-mbp.ini).
-#           Lossless on the output distribution. Three paired runs at temp 1.0:
-#           acceptance 0.698 -> 0.735, mean len 3.50 -> 3.55, tg +1.2%. Small
-#           because p-min 0.7 already cuts the chain. Conflicts with 28473 in
-#           common/speculative.cpp (one hunk, rerere-resolved).
 #   28992 - get_available_slot() only consulted the prompt cache when the
 #           outgoing slot state was worth saving (f_keep < 0.5), so a slot
 #           holding a shorter prefix of the request kept it even when the cache
@@ -64,7 +62,9 @@ BRANCH="mtp-extras"
 #           build_sampling() marks inactive samplers as outputs too. Without it the
 #           allocator reuses a stale plan whenever the set of sampling slots
 #           changes, corrupting draft candidates under backend sampling with
-#           several slots (issue #29313).
+#           several slots (issue #29313). Its tests collide with master's
+#           alloc_buffer_n tests (#23671) in tests/test-alloc.cpp; both sides
+#           are additive, rerere keeps both.
 # Ported rather than merged: 28333 (zeroes the MTP carrier at sequence start, so
 # identical deterministic requests stop diverging against a long-lived server) is
 # patches/0005 because master's batch_ext migration (#29385/#29601) rewrote the
@@ -77,7 +77,11 @@ BRANCH="mtp-extras"
 # listed: 27941 (qwen4exp follow-up fixes) and 28121 (ssm_a/ggml_scan flag), both
 # squash-merged 2026-09-01; 28330 (indexer KV cache drops its unused V half,
 # 612 -> 204 MiB at 131072 ctx), squash-merged 2026-09-10 as 311d4211b; 29075
-# (Metal fa-vec tuned table keyed by GPU family), merged 2026-09-23. A squash
+# (Metal fa-vec tuned table keyed by GPU family), merged 2026-09-23; 27694
+# (probabilistic drafter with rejection sampling, --spec-draft-sampling
+# probabilistic), squash-merged 2026-10-02 as 1fb7ef3e3 - the merged content is
+# line-for-line identical to the head the last build carried, so no functional
+# change for the running binary. A squash
 # lands the code under a new SHA, so the ancestry check below never fired for
 # any of them and they were being re-merged on every run; the GitHub state check
 # is what caught them.
@@ -108,7 +112,7 @@ BRANCH="mtp-extras"
 # qwen4exp changes, and was already disabled at runtime by LLAMA_QSA_NO_POOLED_CACHE=1
 # because it aborts with two slots on the unified cache. Retake it once it rebases
 # onto master and passes bench-slots.sh.
-EXTRA_PRS=(28022 28232 28092 28473 28007 28785 27694 28992 29370)
+EXTRA_PRS=(28022 28232 28092 28473 28007 28785 28992 29370)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {
