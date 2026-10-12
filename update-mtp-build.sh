@@ -23,9 +23,6 @@ BRANCH="mtp-extras"
 #           frees every cached prefix and the next prompt is fully cold: measured
 #           at 28903 tokens / 38.1 s after a sleep against 4 tokens / 0.08 s on a
 #           warm repeat. This is the single largest agent-workload win found.
-#   28232 - truncates speculative results at EOG before rollback, so draft-mtp
-#           stops leaving accepted tokens past the end-of-generation token in the
-#           slot (upstream issue #28049). Retest of an earlier void null.
 #   28092 - --cache-dir (named --cache-disk until 2026-09-14): the prompt cache
 #           persists to disk and reloads on start, covering the case #28022 does
 #           not - a restart or reboot, which is what every rebuild of this
@@ -104,6 +101,10 @@ BRANCH="mtp-extras"
 # garbled replies when two slots run concurrently on the unified cache (PR+master
 # and PR+28699 pass the probe, adding 29166 fails it), and the symptom it claims
 # to fix does not reproduce here without it. See QWEN_NEXT.md.
+# Dropped 2026-10-12: 28232 (EOG truncation, issue #28049) - still open, but
+# superseded by #29638 (merged 2026-09-29 as d280808f5), which stops accepting
+# draft tokens at EOG inside common_sampler_sample_and_accept_n and needs no
+# server change. Builds since 2026-09-29 carried both.
 # Dropped 2026-10-02 with the move to a master base: 27836 (superseded by #29761).
 # 28305 (static backend sampling subgraph) - measured null on 2026-09-08 and now
 # conflicts with master's rewrite of graph_max_nodes; 29370 is the actual fix for
@@ -112,7 +113,7 @@ BRANCH="mtp-extras"
 # qwen4exp changes, and was already disabled at runtime by LLAMA_QSA_NO_POOLED_CACHE=1
 # because it aborts with two slots on the unified cache. Retake it once it rebases
 # onto master and passes bench-slots.sh.
-EXTRA_PRS=(28022 28232 28092 28473 28007 28785 28992 29370)
+EXTRA_PRS=(28022 28092 28473 28007 28785 28992 29370)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {
