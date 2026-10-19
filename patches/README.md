@@ -8,7 +8,7 @@ Regenerate after changing them by hand:
     git -C ~/git/llama.cpp-pr27836 diff -- tools/server/server-context.cpp > patches/0004-server-context-has-better-args.patch
     git -C ~/git/llama.cpp-pr27836 diff -- common/speculative.cpp > patches/0005-speculative-mtp-zero-carrier.patch
 
-0001 and 0004 both touch `tools/server/server-context.cpp`; regenerate them one hunk at a time (stage the other first, then `git diff` gives only the unstaged hunk).
+0001 and 0004 both touch `tools/server/server-context.cpp`; regenerate them one hunk at a time (stage the other first, then `git diff` gives only the unstaged hunk). Regenerate both whenever either needs the `--3way` fallback: on 2026-10-17 a fallback on 0004 silently dropped 0001's hunk, so the script now stops if any patch is missing from the tree after applying.
 
 ## 0001-server-context-local.patch
 
@@ -32,7 +32,7 @@ Retired with the move from PR #27836 to a master base: #29761's loader creates `
 
 One hunk, in `tools/server/server-context.cpp`, needed only while #28992 is carried.
 
-**Pass #28092's arguments to `has_better()`.** #28992 splits the prompt-cache search out of `load()` and asks it from `get_available_slot()` before deciding whether to touch the cache. In our tree `load()` carries #28092's extra parameters (`ctx_tgt`, `id_slot`, `cache_prompt`, `needs_checkpoint`, `n_swa`, `slot_prompt_similarity`) because the disk entries need them for checkpoint admissibility, so `find_better()`/`has_better()` take the same set. The `server-task.*` half of that lives in a rerere resolution; this hunk is the call site, which git auto-merges to the PR's two-argument form and which rerere therefore cannot carry. It hoists `needs_checkpoint` above the call and passes what `prompt_load()` passes. Drop with #28992, or when #28992 rebases onto #28092.
+**Pass #28092's arguments to `has_better()`.** #28992 splits the prompt-cache search out of `load()` and asks it from `get_available_slot()` before deciding whether to touch the cache. In our tree `load()` carries #28092's extra parameters (`ctx_tgt`, `id_slot`, `cache_prompt`, `needs_checkpoint`, `n_swa`, `slot_prompt_similarity`) because the disk entries need them for checkpoint admissibility, so `find_better()`/`has_better()` take the same set. The `server-task.*` half of that lives in a rerere resolution; this hunk is the call site, which git auto-merges to the PR's two-argument form and which rerere therefore cannot carry. It hoists `needs_checkpoint` above the call and passes what `prompt_load()` passes. Drop with #28992, or when #28992 rebases onto #28092. The script skips it, with a warning, on runs where #28092 or #28992 does not merge.
 
 ## 0005-speculative-mtp-zero-carrier.patch
 

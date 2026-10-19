@@ -1,8 +1,8 @@
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index ad4eb3578..163571047 100644
+index d11b3730b..8a126faba 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -3722,7 +3722,7 @@ private:
+@@ -4288,7 +4288,7 @@ private:
                          //  - 4
                          // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                          if (do_checkpoint) {

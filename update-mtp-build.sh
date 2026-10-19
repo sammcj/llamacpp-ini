@@ -30,7 +30,11 @@ BRANCH="mtp-extras"
 #           against 28022 goes stale and the script builds WITHOUT it, which
 #           the router then reports as "option 'cache-dir' not recognized".
 #           Resolve once by hand (keep 28092's disk/RAM split, put 28022's
-#           short-write checks on the RAM branch using discard()).
+#           short-write checks on the RAM branch using discard()). Re-resolved
+#           2026-10-17 against master's #30580 (SWA reuse off-by-two): the fix
+#           lives in 28092's server_prompt_pos_min_thold() so the disk entries'
+#           checkpoint checks get it too, and 28022's sleep_preserve_cache guard
+#           wraps 28092's prompt cache constructor.
 #   28473 - fixes draft-mtp cross-slot content contamination with --parallel > 1
 #           (upstream issue #28286). samm-mbp.ini runs parallel auto (4 slots), so
 #           this is a correctness fix, not a speed one. Output stays plausible when
@@ -55,6 +59,8 @@ BRANCH="mtp-extras"
 #           signature (the disk entries need ctx_tgt/id_slot/n_swa for their
 #           checkpoint admissibility), so the has_better call site passes the
 #           same arguments prompt_load does; rerere-resolved in server-task.*.
+#           The can_cache gate uses master's !task.is_stateless() (#30498)
+#           rather than the PR's completion-only check.
 #   29370 - ggml-alloc re-plans when a tensor's input/output flag changes, and
 #           build_sampling() marks inactive samplers as outputs too. Without it the
 #           allocator reuses a stale plan whenever the set of sampling slots
@@ -313,10 +319,29 @@ done
 # working-tree edits or stashes - 0001 alone is a silent 8x on cached turns.
 # --3way lets them survive upstream moving the surrounding code. See
 # patches/README.md.
+# 0004 passes #28092's arguments at #28992's call site, so it cannot apply when
+# either merge is dropped. Skip it rather than fail the build; the merge warning
+# above and the summary below already report the missing PR.
+apply_patches=()
 for patch in "${patches[@]}"; do
+  if [[ "$(basename "${patch}")" == 0004-* ]] \
+    && [[ " ${extra_states[*]} " == *" #28092:MISSING "* || " ${extra_states[*]} " == *" #28992:MISSING "* ]]; then
+    echo "warning: skipping $(basename "${patch}"); it needs PRs #28092 and #28992, and one did not merge." >&2
+    continue
+  fi
+  apply_patches+=("${patch}")
+done
+for patch in "${apply_patches[@]}"; do
   git -C "${WORKTREE}" apply --3way "${patch}" \
     || die "local patch $(basename "${patch}") no longer applies; fix it before building"
   echo "Applied $(basename "${patch}")."
+done
+# A --3way fallback on one patch can drop an earlier patch's hunk in the same file
+# without an error (0004 erased 0001's checkpoint offset on 2026-10-17). Check each
+# patch's result is still in the tree; regenerate any that fall back.
+for patch in "${apply_patches[@]}"; do
+  git -C "${WORKTREE}" apply -R --check "${patch}" 2>/dev/null \
+    || die "local patch $(basename "${patch}") is not in the tree after applying; regenerate it (see patches/README.md)"
 done
 
 # Use the same cmake preset as the main repo's build.sh (untracked file, so the

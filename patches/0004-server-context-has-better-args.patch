@@ -1,10 +1,10 @@
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 02d89c855..c7a1e39d9 100644
+index b40b05a3b..d11b3730b 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1801,9 +1801,16 @@ private:
-             // cache prompts only for completion tasks
-             const bool can_cache = prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+@@ -1934,9 +1934,16 @@ private:
+             // cache prompts only for the tasks that reuse them
+             const bool can_cache = prompt_cache && !task.is_stateless();
  
 +            const bool needs_checkpoint =
 +                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
@@ -20,7 +20,7 @@ index 02d89c855..c7a1e39d9 100644
  
              if (update_cache) {
                  SRV_TRC("%s", "updating prompt cache\n");
-@@ -1812,10 +1819,6 @@ private:
+@@ -1945,10 +1952,6 @@ private:
  
                  ret->prompt_save(*prompt_cache);
  
