@@ -97,22 +97,14 @@ fi
 # Router mode = launch with no -m/-hf model. The router loads models on demand
 # and unloads them after the idle timeout below.
 #
-# The idle sleep used to throw away the prompt cache: handle_sleeping_state() calls
-# destroy(), and load_model() then rebuilds prompt_cache with make_unique, so waking
-# left the next agent prompt fully cold - a 28903-token prompt back at ~38 s.
+# The idle sleep throws away the prompt cache: handle_sleeping_state() calls destroy(),
+# and load_model() then rebuilds prompt_cache with make_unique, so waking leaves the
+# next agent prompt fully cold - a 28903-token prompt back at ~38 s. PR #28022
+# (--sleep-preserve-cache) fixed that and was carried until 2026-10-28; #29408 is the
+# upstream candidate now (issue #29322). A restart loses the cache the same way.
+# Figures and method in QWEN_NEXT.md.
 #
-# --sleep-preserve-cache (PR #28022) writes the idle slot states into the prompt cache
-# before sleeping and restores them on wake, taking that to 0.1 s of prefill and 3.2 s
-# of wall time, the wall being the weight reload. Off by default upstream, so it has to
-# be passed explicitly. Figures and method in QWEN_NEXT.md.
-#
-# With the cache surviving, sleeping costs only that reload, so the idle window no
-# longer has to span a working day. An hour frees the ~94 GB over lunch and overnight
-# while keeping the reload rare. LLAMA_SLEEP_IDLE=-1 never sleeps.
-#
-# Note the interaction with the per-model --cache-dir that sync-models.py sets: each
-# sleep runs every idle slot through prompt_save, so a shorter idle window means more
-# writes - up to ~900 MiB per slot per sleep, several times a day.
+# An hour frees the ~94 GB over lunch and overnight. LLAMA_SLEEP_IDLE=-1 never sleeps.
 SLEEP_IDLE="${LLAMA_SLEEP_IDLE:-3600}"
 
 # Router-level: how many models stay resident. The router only applies the preset's
@@ -122,26 +114,10 @@ SLEEP_IDLE="${LLAMA_SLEEP_IDLE:-3600}"
 # each other and the second load drove free RAM to 1%. LLAMA_MODELS_MAX=0 is unlimited.
 MODELS_MAX="${LLAMA_MODELS_MAX:-1}"
 
-# A restart loses the cache outright, since it only ever lived in RAM. --cache-dir
-# (PR #28092) fixes that, but it is set per model by sync-models.py rather than here:
-# the router builds its child presets from its own argv, so a path given here would be
-# handed to every child, and a child deletes every entry in its cache directory whose
-# key is not its own. One shared path means loading a second model wipes the first
-# model's cache. See cache_disk_overrides() in sync-models.py.
-#
-# #28022 is not upstream yet and an unknown flag is fatal, so only pass it to a binary
-# that advertises it. Drop this probe once it lands in master.
-SLEEP_ARGS=(--sleep-idle-seconds "${SLEEP_IDLE}")
-if "${LLAMA_SERVER_BIN}" --help 2>&1 | grep -q -- '--sleep-preserve-cache'; then
-    SLEEP_ARGS+=(--sleep-preserve-cache)
-else
-    echo "note: ${LLAMA_SERVER_BIN} has no --sleep-preserve-cache; waking will be cold." >&2
-fi
-
 exec "${LLAMA_SERVER_BIN}" \
     --host 127.0.0.1 \
     --models-dir "${MODELS_DIR}" \
     --models-preset "${PRESET}" \
     --models-max "${MODELS_MAX}" \
-    "${SLEEP_ARGS[@]}" \
+    --sleep-idle-seconds "${SLEEP_IDLE}" \
     "$@"

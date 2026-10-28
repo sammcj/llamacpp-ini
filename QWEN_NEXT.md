@@ -165,6 +165,8 @@ Three candidates were eliminated by direct A/B, each a null:
 
 ### The idle sleep was the actual problem (2026-09-02, measured)
 
+_Status 2026-10-28: #28022 and #28092 are no longer carried, so a wake or restart is cold again. See UPSTREAM-CANDIDATES.md._
+
 Before any of the per-op work below matters, this: `handle_sleeping_state()` calls `destroy()`, and `load_model()` then rebuilds `prompt_cache` with `make_unique`. Waking discards every cached prefix.
 
 `bench-sleep-cache.sh`, one 28903-token prompt sent three times (build 9359, before any of the PRs below):
@@ -570,6 +572,8 @@ Nine requests, cold start to 55k tokens, production router config. This is the f
 **Depth tracks decode at least as strongly as mean accepted length here.** Over the nine requests, tg vs depth is **r = -0.798**, tg vs mean length **r = +0.778**, tg vs acceptance **r = +0.650**. The section above states decode tracks mean accepted length *and not* context depth. With n=9 and the two confounded - later turns are both deeper and lower-mean-len - this does not refute it, but that claim is not settled and should not be relied on for tuning decisions.
 
 ## `--cache-disk` works; every rebuild wipes it (2026-09-04, measured)
+
+_Status 2026-10-28: #28092 is no longer carried._
 
 A real pi session left the cache directory **empty**, with `restored 0 persistent prompt cache entries` at startup. The feature itself is fine - tested directly:
 

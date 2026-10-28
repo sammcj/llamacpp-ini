@@ -19,22 +19,6 @@ BRANCH="mtp-extras"
 # Extra PRs merged on top of master, in order. Stacking is NOT free - #27992
 # plus #27977 together regressed TG ~18% at 32K - so each entry earns its place
 # with a both-orders A/B before it is added, and the reason lives beside it.
-#   28022 - preserves the prompt cache across an idle sleep. Without it, waking
-#           frees every cached prefix and the next prompt is fully cold: measured
-#           at 28903 tokens / 38.1 s after a sleep against 4 tokens / 0.08 s on a
-#           warm repeat. This is the single largest agent-workload win found.
-#   28092 - --cache-dir (named --cache-disk until 2026-09-14): the prompt cache
-#           persists to disk and reloads on start, covering the case #28022 does
-#           not - a restart or reboot, which is what every rebuild of this
-#           worktree causes. Its head moves; when it does, the rerere resolution
-#           against 28022 goes stale and the script builds WITHOUT it, which
-#           the router then reports as "option 'cache-dir' not recognized".
-#           Resolve once by hand (keep 28092's disk/RAM split, put 28022's
-#           short-write checks on the RAM branch using discard()). Re-resolved
-#           2026-10-17 against master's #30580 (SWA reuse off-by-two): the fix
-#           lives in 28092's server_prompt_pos_min_thold() so the disk entries'
-#           checkpoint checks get it too, and 28022's sleep_preserve_cache guard
-#           wraps 28092's prompt cache constructor.
 #   28473 - fixes draft-mtp cross-slot content contamination with --parallel > 1
 #           (upstream issue #28286). samm-mbp.ini runs parallel auto (4 slots), so
 #           this is a correctness fix, not a speed one. Output stays plausible when
@@ -42,24 +26,19 @@ BRANCH="mtp-extras"
 #           Conflicts in common/speculative.cpp with 27694's code, which now sits
 #           on master: the conflict is 28473 vs master rather than 28473 vs a PR
 #           head, so the old rerere recording may not replay - if it lands as
-#           MISSING, re-resolve the one hunk by hand once.
+#           MISSING, re-resolve the one hunk by hand once. Its appended
+#           test_mtp_output_budget also collides with master's
+#           test_draft_token_probs (#27196) at the end of test_speculative.py;
+#           both are additive, rerere keeps both (recorded 2026-10-26).
 #   28007 - falls back to full reprocessing when hybrid seq_rm refuses a rollback
 #           past the RS ring instead of aborting the server (upstream issue #27931).
 #           13 lines, safety only.
-#   28785 - ggml-cpu skips the threadpool wake-up when the graph has no CPU work,
-#           which is every graph at -ngl 999. ggml-cpu.c only. Measured 2026-09-13
-#           as part of the four-PR arm: null on short decode (57.2 vs 56.7-57.4)
-#           and on cold prefill (777.9 vs 783.2 tok/s). Kept as harmless.
 #   28992 - get_available_slot() only consulted the prompt cache when the
 #           outgoing slot state was worth saving (f_keep < 0.5), so a slot
 #           holding a shorter prefix of the request kept it even when the cache
 #           held a longer one, and an empty slot divided by zero. Splits the
 #           search out of load() as find_better()/has_better() and asks the
-#           cache before deciding. Rebased by hand onto 28092's load()
-#           signature (the disk entries need ctx_tgt/id_slot/n_swa for their
-#           checkpoint admissibility), so the has_better call site passes the
-#           same arguments prompt_load does; rerere-resolved in server-task.*.
-#           The can_cache gate uses master's !task.is_stateless() (#30498)
+#           cache before deciding. The can_cache gate uses master's !task.is_stateless() (#30498)
 #           rather than the PR's completion-only check.
 #   29370 - ggml-alloc re-plans when a tensor's input/output flag changes, and
 #           build_sampling() marks inactive samplers as outputs too. Without it the
@@ -74,8 +53,9 @@ BRANCH="mtp-extras"
 # lines it touches and the PR has not moved since 2026-09-04.
 # Candidates not yet taken: 27210 (adaptive MTP draft depth) conflicts with 28473
 # in common/speculative.cpp and needs spec-draft-n-max >= 7 (we run 5), so it is
-# a retune, not a drop-in. 25592 (hybrid checkpoint validity) rewrites the same
-# checkpoint-selection predicate 28092 does; semantic conflict, parked.
+# a retune, not a drop-in. 25592 (hybrid checkpoint validity) was parked for
+# rewriting the same checkpoint-selection predicate as 28092; unblocked now 28092
+# is gone, but not yet measured.
 # Merged upstream, so they now arrive through origin/master and are no longer
 # listed: 27941 (qwen4exp follow-up fixes) and 28121 (ssm_a/ggml_scan flag), both
 # squash-merged 2026-09-01; 28330 (indexer KV cache drops its unused V half,
@@ -111,6 +91,17 @@ BRANCH="mtp-extras"
 # superseded by #29638 (merged 2026-09-29 as d280808f5), which stops accepting
 # draft tokens at EOG inside common_sampler_sample_and_accept_n and needs no
 # server change. Builds since 2026-09-29 carried both.
+# Dropped 2026-10-28: 28785 (ggml-cpu skips the threadpool wake-up when the graph
+# has no CPU work) - measured null 2026-09-13 on short decode (57.2 vs 56.7-57.4)
+# and cold prefill (777.9 vs 783.2 tok/s); only added merge surface.
+# Dropped 2026-10-28: 28022 (--sleep-preserve-cache, prompt cache survives idle
+# sleep; 38.1 s -> 0.08 s on wake) and 28092 (--cache-dir, prompt cache persists to
+# disk across restarts; 39.7 s -> 0.09 s). Both open but unreviewed and stalled
+# (last activity 2026-08-30 and 2026-09-24), and every master change to the
+# kv-cache ctor or server-context needed a hand re-resolve. 28092 has an
+# unanswered livelock report from writing GPU state into a MAP_SHARED mapping.
+# #29408 duplicates 28022 (issue #29322); take whichever lands. With both gone,
+# 28992 merges in its own two-argument form and patches/0004 was deleted.
 # Dropped 2026-10-02 with the move to a master base: 27836 (superseded by #29761).
 # 28305 (static backend sampling subgraph) - measured null on 2026-09-08 and now
 # conflicts with master's rewrite of graph_max_nodes; 29370 is the actual fix for
@@ -119,7 +110,7 @@ BRANCH="mtp-extras"
 # qwen4exp changes, and was already disabled at runtime by LLAMA_QSA_NO_POOLED_CACHE=1
 # because it aborts with two slots on the unified cache. Retake it once it rebases
 # onto master and passes bench-slots.sh.
-EXTRA_PRS=(28022 28092 28473 28007 28785 28992 29370)
+EXTRA_PRS=(28473 28007 28992 29370)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {
@@ -319,27 +310,16 @@ done
 # working-tree edits or stashes - 0001 alone is a silent 8x on cached turns.
 # --3way lets them survive upstream moving the surrounding code. See
 # patches/README.md.
-# 0004 passes #28092's arguments at #28992's call site, so it cannot apply when
-# either merge is dropped. Skip it rather than fail the build; the merge warning
-# above and the summary below already report the missing PR.
-apply_patches=()
 for patch in "${patches[@]}"; do
-  if [[ "$(basename "${patch}")" == 0004-* ]] \
-    && [[ " ${extra_states[*]} " == *" #28092:MISSING "* || " ${extra_states[*]} " == *" #28992:MISSING "* ]]; then
-    echo "warning: skipping $(basename "${patch}"); it needs PRs #28092 and #28992, and one did not merge." >&2
-    continue
-  fi
-  apply_patches+=("${patch}")
-done
-for patch in "${apply_patches[@]}"; do
   git -C "${WORKTREE}" apply --3way "${patch}" \
     || die "local patch $(basename "${patch}") no longer applies; fix it before building"
   echo "Applied $(basename "${patch}")."
 done
 # A --3way fallback on one patch can drop an earlier patch's hunk in the same file
-# without an error (0004 erased 0001's checkpoint offset on 2026-10-17). Check each
-# patch's result is still in the tree; regenerate any that fall back.
-for patch in "${apply_patches[@]}"; do
+# without an error (a since-deleted 0004 erased 0001's checkpoint offset on
+# 2026-10-17). Check each patch's result is still in the tree; regenerate any that
+# fall back.
+for patch in "${patches[@]}"; do
   git -C "${WORKTREE}" apply -R --check "${patch}" 2>/dev/null \
     || die "local patch $(basename "${patch}") is not in the tree after applying; regenerate it (see patches/README.md)"
 done
