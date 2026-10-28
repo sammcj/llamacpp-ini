@@ -19,17 +19,6 @@ BRANCH="mtp-extras"
 # Extra PRs merged on top of master, in order. Stacking is NOT free - #27992
 # plus #27977 together regressed TG ~18% at 32K - so each entry earns its place
 # with a both-orders A/B before it is added, and the reason lives beside it.
-#   28473 - fixes draft-mtp cross-slot content contamination with --parallel > 1
-#           (upstream issue #28286). samm-mbp.ini runs parallel auto (4 slots), so
-#           this is a correctness fix, not a speed one. Output stays plausible when
-#           it misfires, which is why nobody noticed. Still in draft upstream.
-#           Conflicts in common/speculative.cpp with 27694's code, which now sits
-#           on master: the conflict is 28473 vs master rather than 28473 vs a PR
-#           head, so the old rerere recording may not replay - if it lands as
-#           MISSING, re-resolve the one hunk by hand once. Its appended
-#           test_mtp_output_budget also collides with master's
-#           test_draft_token_probs (#27196) at the end of test_speculative.py;
-#           both are additive, rerere keeps both (recorded 2026-10-26).
 #   28007 - falls back to full reprocessing when hybrid seq_rm refuses a rollback
 #           past the RS ring instead of aborting the server (upstream issue #27931).
 #           13 lines, safety only.
@@ -38,8 +27,8 @@ BRANCH="mtp-extras"
 #           holding a shorter prefix of the request kept it even when the cache
 #           held a longer one, and an empty slot divided by zero. Splits the
 #           search out of load() as find_better()/has_better() and asks the
-#           cache before deciding. The can_cache gate uses master's !task.is_stateless() (#30498)
-#           rather than the PR's completion-only check.
+#           cache before deciding. The can_cache gate uses master's
+#           !task.is_stateless() (#30498) rather than the PR's completion-only check.
 #   29370 - ggml-alloc re-plans when a tensor's input/output flag changes, and
 #           build_sampling() marks inactive samplers as outputs too. Without it the
 #           allocator reuses a stale plan whenever the set of sampling slots
@@ -51,9 +40,8 @@ BRANCH="mtp-extras"
 # identical deterministic requests stop diverging against a long-lived server) is
 # patches/0005 because master's batch_ext migration (#29385/#29601) rewrote the
 # lines it touches and the PR has not moved since 2026-09-04.
-# Candidates not yet taken: 27210 (adaptive MTP draft depth) conflicts with 28473
-# in common/speculative.cpp and needs spec-draft-n-max >= 7 (we run 5), so it is
-# a retune, not a drop-in. 25592 (hybrid checkpoint validity) was parked for
+# Candidates not yet taken: 27210 (adaptive MTP draft depth) needs
+# spec-draft-n-max >= 7 (we run 5), so it is a retune, not a drop-in. 25592 (hybrid checkpoint validity) was parked for
 # rewriting the same checkpoint-selection predicate as 28092; unblocked now 28092
 # is gone, but not yet measured.
 # Merged upstream, so they now arrive through origin/master and are no longer
@@ -102,6 +90,13 @@ BRANCH="mtp-extras"
 # unanswered livelock report from writing GPU state into a MAP_SHARED mapping.
 # #29408 duplicates 28022 (issue #29322); take whichever lands. With both gone,
 # 28992 merges in its own two-argument form and patches/0004 was deleted.
+# Dropped 2026-10-28: 28473 (MTP stops drafting at the per-sequence n_max, for
+# cross-slot contamination issue #28286). Master's generic draft truncation
+# (#27694/#29924) already trims an over-long MTP draft before verify, so the PR
+# only saves a few draft steps. Without it, 4 concurrent slots on two unrelated
+# topics (300+ tokens, ~270 drafted each, temp 0 and 1.0) showed 0/12 replies with
+# the other topic's vocabulary, and temp-0 same-topic slots were token-identical;
+# bench-slots.sh also 3/3. Draft since 2026-09-06; #28286 stale-closed 2026-10-18.
 # Dropped 2026-10-02 with the move to a master base: 27836 (superseded by #29761).
 # 28305 (static backend sampling subgraph) - measured null on 2026-09-08 and now
 # conflicts with master's rewrite of graph_max_nodes; 29370 is the actual fix for
@@ -110,7 +105,7 @@ BRANCH="mtp-extras"
 # qwen4exp changes, and was already disabled at runtime by LLAMA_QSA_NO_POOLED_CACHE=1
 # because it aborts with two slots on the unified cache. Retake it once it rebases
 # onto master and passes bench-slots.sh.
-EXTRA_PRS=(28473 28007 28992 29370)
+EXTRA_PRS=(28007 28992 29370)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {
