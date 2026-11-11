@@ -29,6 +29,8 @@ BRANCH="mtp-extras"
 #           search out of load() as find_better()/has_better() and asks the
 #           cache before deciding. The can_cache gate uses master's
 #           !task.is_stateless() (#30498) rather than the PR's completion-only check.
+#           Since #30779 (2026-11-07) load() reads lcp_best, which the PR moves into
+#           find_better(); patches/0006 recomputes it there.
 #   29370 - ggml-alloc re-plans when a tensor's input/output flag changes, and
 #           build_sampling() marks inactive samplers as outputs too. Without it the
 #           allocator reuses a stale plan whenever the set of sampling slots

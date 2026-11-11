@@ -6,6 +6,7 @@ Regenerate after changing them by hand:
 
     git -C ~/git/llama.cpp-pr27836 diff -- tools/server/server-context.cpp > patches/0001-server-context-local.patch
     git -C ~/git/llama.cpp-pr27836 diff -- common/speculative.cpp > patches/0005-speculative-mtp-zero-carrier.patch
+    git -C ~/git/llama.cpp-pr27836 diff -- tools/server/server-task.cpp > patches/0006-server-task-full-restore-lcp.patch
 
 If two patches ever touch the same file, regenerate them one hunk at a time (stage the other first, then `git diff` gives only the unstaged hunk). On 2026-10-17 a `--3way` fallback on one patch silently dropped another's hunk in the same file, so the script now stops if any patch is missing from the tree after applying.
 
@@ -38,3 +39,9 @@ Retired with #28092: without its extended `load()` signature, #28992 merges in i
 Four lines, in `common/speculative.cpp`. Port of [#28333](https://github.com/ggml-org/llama.cpp/pull/28333), which no longer merges after master moved draft-mtp onto `llama_batch_ext` (#29385, #29601).
 
 **Zero the MTP carrier at sequence start.** `pending_h` holds the last target embedding per sequence and feeds the first token of the next catch-up batch. Nothing cleared it when a slot started a new request, so the first draft of a fresh sequence used the previous request's hidden state and identical deterministic requests could produce different tokens against a long-lived server. Drop when #28333 lands or rebases onto master.
+
+## 0006-server-task-full-restore-lcp.patch
+
+One line, in `tools/server/server-task.cpp`. Fix-up for #28992 on top of master.
+
+**Recompute the prefix length for the full-restore tag.** #30779 (merged 2026-11-07) tracks `lcp_best` in `server_prompt_cache::load()` to log `__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__`. #28992 moves the search, and `lcp_best` with it, into `find_better()`, so the merged `load()` refers to an undeclared variable. The conflict at the function header is a rerere resolution (`find_better()` with a non-const `lcp_best`, since master's loop assigns it); this line sits outside that hunk, so rerere cannot carry it. Drop when #28992 rebases past #30779. Fails to apply, and stops the build, if #28992 does not merge.
