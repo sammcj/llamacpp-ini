@@ -98,7 +98,7 @@ class Config:
     # PrismML ternary quants: only their llama.cpp fork loads these (and the official
     # llama-gguf aborts on them), so they run via run-llama-server.sh --bonsai.
     fork_only_quant: str = r"(?i)[._-]P(?:T?Q)[0-9]+_[0-9]+\.gguf$"
-    cache_version: int = 5  # probe-cache schema; bump to invalidate old caches
+    cache_version: int = 6  # probe-cache schema; bump to invalidate old caches
 
     # --- Size-tier thresholds, in GB (env: SIZE_SMALL_KV_GB / SIZE_CKPT_GB) ---
     # They stack: a model can match more than one tier. See SIZE_TIERS for wiring.
@@ -198,6 +198,7 @@ class ModelKind(Enum):
     PAIRED = auto()  # no nextn, separate head exists (Gemma 4): spec-draft-model
     NGRAM = auto()  # no MTP at all: model-free ngram speculation fallback
     NO_SPEC = auto()  # embedding model; speculation is meaningless
+    DECISION = auto()  # System One decision model (<arch>.decision.type): no generation
 
 
 KIND_SPEC: dict[ModelKind, str] = {
@@ -208,6 +209,29 @@ KIND_SPEC: dict[ModelKind, str] = {
     ModelKind.NGRAM: "ngram-mod",
     # Speculation is meaningless for an embedding model.
     ModelKind.NO_SPEC: "none",
+    ModelKind.DECISION: "none",
+}
+
+# Decision models (served on /v1/systemone) read the whole prompt in one ubatch,
+# so ubatch-size caps the prompt: at the 512 default a 2.5K-token state fails
+# with "input is too large". 16K measured on GLiDE-27B Q4_K_M: 2456-token state
+# in 3.4 s, 12 GB footprint beyond the weights. One slot: a 4-question request
+# on a 2.5K state took 17.5 s at -np 1 vs 24.0 (np 4) and 22.8 (np 8), same
+# answers - questions are full non-causal passes, so packing them into one
+# ubatch only adds cross-sequence attention work. With one slot, ctx-size only
+# needs one full prompt. f16 KV beat q8_0 (22.9 s); -fa off fails to create
+# the context at this ubatch. cache-ram = 0 restores llama-server's
+# decision-model default (states rarely repeat), which the explicit [*]
+# cache-ram would otherwise override.
+DECISION_UBATCH = 16384
+DECISION_OVERRIDES: dict[str, str] = {
+    "batch-size": str(DECISION_UBATCH),
+    "ubatch-size": str(DECISION_UBATCH),
+    "ctx-size": str(DECISION_UBATCH),
+    "parallel": "1",
+    "cache-type-k": "f16",
+    "cache-type-v": "f16",
+    "cache-ram": "0",
 }
 
 
@@ -317,6 +341,7 @@ class ProbeResult:
     diffusion: bool  # arch only runs under llama-diffusion-cli
     embed: bool  # carries <arch>.pooling_type -> an embedding model
     dflash: bool  # arch = dflash -> a speculative draft, not a runnable model
+    decision: bool  # carries <arch>.decision.type -> a /v1/systemone decision model
     ok: bool = True  # False = never probed; every flag above is "unknown", not "no"
 
 
@@ -355,10 +380,11 @@ class Prober:
                     diffusion=False,
                     embed=False,
                     dflash=False,
+                    decision=False,
                     ok=False,
                 )
             self.cache[key] = val
-        cnt, blk, dif, emb, dfl = self._parse(val)
+        cnt, blk, dif, emb, dfl, dec = self._parse(val)
         nextn = cnt > 0
         return ProbeResult(
             nextn=nextn,
@@ -366,6 +392,7 @@ class Prober:
             diffusion=dif > 0,
             embed=emb > 0,
             dflash=dfl > 0,
+            decision=dec > 0,
         )
 
     def _probe_raw(self, f: Path) -> str | None:
@@ -384,7 +411,8 @@ class Prober:
         dif = 1 if arch.startswith(self.cfg.diffusion_arch) else 0
         dfl = 1 if arch == "dflash" else 0
         emb = 1 if any(".pooling_type" in ln for ln in out.splitlines()) else 0
-        return f"{cnt}:{blk}:{dif}:{emb}:{dfl}"
+        dec = 1 if any(".decision.type" in ln for ln in out.splitlines()) else 0
+        return f"{cnt}:{blk}:{dif}:{emb}:{dfl}:{dec}"
 
     def _run_gguf(self, f: Path) -> str | None:
         """llama-gguf's dump for f, or None if it did not run cleanly.
@@ -412,7 +440,7 @@ class Prober:
         return r.stdout or ""
 
     @staticmethod
-    def _parse(val: str) -> tuple[int, int, int, int, int]:
+    def _parse(val: str) -> tuple[int, int, int, int, int, int]:
         # Pad older short cache entries with zeros; treat any garbage as 0
         # (a corrupt cache degrades to "unknown", it never crashes the run).
         def to_int(x: str) -> int:
@@ -421,8 +449,8 @@ class Prober:
             except ValueError:
                 return 0
 
-        p = (val.split(":") + ["0"] * 5)[:5]
-        return (to_int(p[0]), to_int(p[1]), to_int(p[2]), to_int(p[3]), to_int(p[4]))
+        p = [to_int(x) for x in (val.split(":") + ["0"] * 6)[:6]]
+        return (p[0], p[1], p[2], p[3], p[4], p[5])
 
     def save_cache(self) -> None:
         lines = [f"{k}\t{v}" for k, v in sorted(self.cache.items())]
@@ -621,12 +649,13 @@ class Sync:
         if quant:
             tags.append(quant)
 
-        embedded = is_embed = False
+        embedded = is_embed = is_decision = False
         weight_bytes = 0
         for f in files:
             pr = self.prober.probe(f)
             embedded |= pr.nextn and not pr.head
             is_embed |= pr.embed
+            is_decision |= pr.decision
             weight_bytes += f.stat().st_size
 
         overrides = size_overrides(name, weight_bytes, self.cfg)
@@ -637,7 +666,11 @@ class Sync:
             self.size_tiered += sized
             self.templated += "chat-template-file" in overrides
 
-        if embedded:
+        if is_decision:
+            kind, tags = ModelKind.DECISION, tags + ["decision"]
+            head = None
+            overrides.update(DECISION_OVERRIDES)
+        elif embedded:
             kind, tags = ModelKind.EMBEDDED_MTP, tags + ["MTP"]
             head = None
             overrides.update(mtp_draft_overrides(name))
@@ -875,6 +908,7 @@ class Sync:
         paired = [m for m in self.models if m.kind is ModelKind.PAIRED]
         ngram = [m for m in self.models if m.kind is ModelKind.NGRAM]
         nospec = [m for m in self.models if m.kind is ModelKind.NO_SPEC]
+        decision = [m for m in self.models if m.kind is ModelKind.DECISION]
 
         def emit(m: Model) -> str:
             """Key order is deliberate and must be kept: llama-server applies a
@@ -935,6 +969,13 @@ class Sync:
             for m in nospec:
                 parts.append(f"\n\n[{m.name}]\n{emit(m)}".rstrip("\n"))
 
+        if decision:
+            parts.append(
+                "\n\n; --- decision models (POST /v1/systemone, no generation) ---"
+            )
+            for m in decision:
+                parts.append(f"\n\n[{m.name}]\n{emit(m)}".rstrip("\n"))
+
         c.router_ini.write_text("".join(parts) + "\n")
 
     def _summary(self) -> None:
@@ -942,10 +983,12 @@ class Sync:
         paired = sum(1 for m in self.models if m.kind is ModelKind.PAIRED)
         ngram = sum(1 for m in self.models if m.kind is ModelKind.NGRAM)
         nospec = sum(1 for m in self.models if m.kind is ModelKind.NO_SPEC)
+        decision = sum(1 for m in self.models if m.kind is ModelKind.DECISION)
         size_tiered = self.size_tiered
         print(
             f"linked {self.linked} model(s): {mtp} embedded-MTP, {paired} base+head paired, "
-            f"{ngram} ngram fallback, {nospec} no-spec (embeddings), {size_tiered} size-tiered, "
+            f"{ngram} ngram fallback, {nospec} no-spec (embeddings), {decision} decision, "
+            f"{size_tiered} size-tiered, "
             f"{self.templated} Qwen chat-template fix, "
             f"{self.nommproj_twins} no-mmproj twin(s); skipped {self.skipped_heads} MTP head(s), "
             f"{self.skipped_dflash} DFlash draft(s), "

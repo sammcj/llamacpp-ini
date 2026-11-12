@@ -18,6 +18,8 @@ Syncs, then starts the router on `127.0.0.1`. `SKIP_SYNC=1` skips the sync; `./s
 
 Diffusion models (dream, llada, diffusion-gemma) can't load in llama-server. They're excluded from the router and listed in `.generated/diffusion-models.tsv` for use with `llama-diffusion-cli`.
 
+Decision models (GLiDE, vllm-d3) are served on `/v1/systemone` rather than chat completions. See [DECISION_MODELS.md](DECISION_MODELS.md) for how to query them.
+
 ## Per-host config
 
 The base preset is picked by `hostname -s`: `<hostname>.ini`, falling back to `samm-mbp.ini`. An optional `<hostname>.env` is sourced for sync thresholds. `LLAMA_BASE_INI` overrides both.
