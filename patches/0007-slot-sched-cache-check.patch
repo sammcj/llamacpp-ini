@@ -1,0 +1,87 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 8a5efc448..93dd71d7c 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2986,8 +2986,13 @@ private:
+                         }
+                     }
+ 
++                    // select() only flags the cache when the slot's own state is worth saving,
++                    // but the cache can still hold a longer prefix of this task than the slot does
++                    const bool update_cache = prompt_cache && !task.is_stateless() &&
++                        (plan.update_cache || prompt_cache->has_better(slot->prompt, task.tokens));
++
+                     // the task is not deferred past this point
+-                    if (plan.update_cache && prompt_cache) {
++                    if (update_cache) {
+                         update_prompt_cache(*slot, task);
+                     }
+ 
+diff --git a/tools/server/server-slot-sched.cpp b/tools/server/server-slot-sched.cpp
+index 5b33292c2..387228008 100644
+--- a/tools/server/server-slot-sched.cpp
++++ b/tools/server/server-slot-sched.cpp
+@@ -163,8 +163,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+     return &states.back();
+ }
+ 
+-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+-    int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
++std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_better(const server_prompt & prompt, const server_tokens & tokens_new) {
++    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+ 
+     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+     float f_sim_best  = float(lcp_best) / tokens_new.size();
+@@ -190,7 +190,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+             f_keep_best = f_keep_cur;
+             f_sim_best  = f_sim_cur;
+-            lcp_best    = lcp_cur;
+ 
+             it_best = it;
+         }
+@@ -198,7 +197,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+ 
+     if (it_best != states.end()) {
+         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
++    }
+ 
++    return it_best;
++}
++
++bool server_prompt_cache::has_better(const server_prompt & prompt, const server_tokens & tokens_new) {
++    return find_better(prompt, tokens_new) != states.end();
++}
++
++bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
++    auto it_best = find_better(prompt, tokens_new);
++
++    if (it_best != states.end()) {
+         {
+             auto & data = it_best->data.main;
+ 
+@@ -236,7 +247,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+         SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
+ 
+         // the whole cached prompt is a prefix of the new one
+-        if (lcp_best == (int) it_best->prompt.tokens.size()) {
++        if (it_best->prompt.tokens.get_common_prefix(tokens_new) == it_best->prompt.tokens.size()) {
+             SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
+         }
+ 
+diff --git a/tools/server/server-slot-sched.h b/tools/server/server-slot-sched.h
+index 8389d05a5..014c665fe 100644
+--- a/tools/server/server-slot-sched.h
++++ b/tools/server/server-slot-sched.h
+@@ -91,6 +91,11 @@ struct server_prompt_cache {
+ 
+     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+ 
++    // a cached state that is a better starting point than `prompt` for `tokens_new`, or states.end()
++    std::list<server_prompt_cache_state>::iterator find_better(const server_prompt & prompt, const server_tokens & tokens_new);
++
++    bool has_better(const server_prompt & prompt, const server_tokens & tokens_new);
++
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+ 
+     void update();

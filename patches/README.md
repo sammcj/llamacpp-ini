@@ -6,7 +6,7 @@ Regenerate after changing them by hand:
 
     git -C ~/git/llama.cpp-pr27836 diff -- tools/server/server-context.cpp > patches/0001-server-context-local.patch
     git -C ~/git/llama.cpp-pr27836 diff -- common/speculative.cpp > patches/0005-speculative-mtp-zero-carrier.patch
-    git -C ~/git/llama.cpp-pr27836 diff -- tools/server/server-task.cpp > patches/0006-server-task-full-restore-lcp.patch
+    git -C ~/git/llama.cpp-pr27836 diff -- tools/server/server-slot-sched.cpp tools/server/server-slot-sched.h tools/server/server-context.cpp > patches/0007-slot-sched-cache-check.patch
 
 If two patches ever touch the same file, regenerate them one hunk at a time (stage the other first, then `git diff` gives only the unstaged hunk). On 2026-10-17 a `--3way` fallback on one patch silently dropped another's hunk in the same file, so the script now stops if any patch is missing from the tree after applying.
 
@@ -40,8 +40,16 @@ Four lines, in `common/speculative.cpp`. Port of [#28333](https://github.com/ggm
 
 **Zero the MTP carrier at sequence start.** `pending_h` holds the last target embedding per sequence and feeds the first token of the next catch-up batch. Nothing cleared it when a slot started a new request, so the first draft of a fresh sequence used the previous request's hidden state and identical deterministic requests could produce different tokens against a long-lived server. Drop when #28333 lands or rebases onto master.
 
-## 0006-server-task-full-restore-lcp.patch
+## 0006-server-task-full-restore-lcp.patch (retired 2026-11-16)
+
+Retired with #28992, dropped after #32154 moved the prompt cache into `server-slot-sched.cpp`. Original notes follow.
 
 One line, in `tools/server/server-task.cpp`. Fix-up for #28992 on top of master.
 
 **Recompute the prefix length for the full-restore tag.** #30779 (merged 2026-11-07) tracks `lcp_best` in `server_prompt_cache::load()` to log `__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__`. #28992 moves the search, and `lcp_best` with it, into `find_better()`, so the merged `load()` refers to an undeclared variable. The conflict at the function header is a rerere resolution (`find_better()` with a non-const `lcp_best`, since master's loop assigns it); this line sits outside that hunk, so rerere cannot carry it. Drop when #28992 rebases past #30779. Fails to apply, and stops the build, if #28992 does not merge.
+
+## 0007-slot-sched-cache-check.patch
+
+Touches `tools/server/server-slot-sched.cpp`, `server-slot-sched.h` and `server-context.cpp`. Port of #28992's cache check onto master after #32154 moved the prompt cache and slot selection into `server-slot-sched.cpp`.
+
+**Ask the prompt cache before keeping a slot's own prefix.** `server_slot_sched::select()` only flags a cache update when the chosen slot would lose over half its context, or for an LRU pick. A slot holding a short prefix of the request therefore kept it even when the cache held a longer one, and re-prefilled the difference. Measured with #28992 on 2026-09-22: a request landing on a slot with a 1385-token prefix of its 10727-token prompt prefilled 4 tokens instead of ~9.3k. The patch splits the search out of `load()` as `find_better()`/`has_better()` and calls `has_better()` at the launch site in `server-context.cpp`, keeping `select()` const. `load()` recomputes the prefix for the full-restore test tag, which 0006 used to do. Since the patch touches `server-context.cpp` with 0001, regenerate it with 0001 staged (see above).

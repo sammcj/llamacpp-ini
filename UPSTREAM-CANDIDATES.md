@@ -214,7 +214,7 @@ Worth taking:
 Watch, not applicable yet:
 
 - **[#29110](https://github.com/ggml-org/llama.cpp/pull/29110)** - multi-column `mul_mv` kernels for ne11 2..8, the exact `mul_mv_ext` cost the section above documents (the author measures verify at n_max 2 costing as much as generation). Selected per op on Q4_0/Q8_0 weights, `mul_mat` only. Here that covers the Q8_0 attention projections (9.5% of weights) and none of the IQ3_S/IQ4_NL experts or the PLE table. Partial win bounded by attention's share of decode; A/B once it merges.
-- **[#28992](https://github.com/ggml-org/llama.cpp/pull/28992)** - **in the build.** `get_available_slot()` skipped the prompt-cache lookup when `f_keep >= 0.5` even though another cached prompt was a better prefix, and divided by zero on an empty slot. Multi-slot agent traffic is where it bites. Rebased by hand onto #28092's `load()`: `find_better()`/`has_better()` take #28092's extra arguments because the disk entries need `ctx_tgt`/`id_slot`/`n_swa` for checkpoint admissibility. The `server-task.*` half is a rerere resolution; the call site is `patches/0004` because git auto-merges it to the PR's two-argument form. Unmeasured; the shape to test is a second slot holding a shorter prefix of a request the cache has in full.
+- **[#28992](https://github.com/ggml-org/llama.cpp/pull/28992)** - **dropped 2026-11-16** (stale since 2026-09, conflicts with #32154 `server-slot-sched.cpp`; cache check ported as patches/0007). `get_available_slot()` skipped the prompt-cache lookup when `f_keep >= 0.5` even though another cached prompt was a better prefix, and divided by zero on an empty slot. Multi-slot agent traffic is where it bites. Rebased by hand onto #28092's `load()`: `find_better()`/`has_better()` take #28092's extra arguments because the disk entries need `ctx_tgt`/`id_slot`/`n_swa` for checkpoint admissibility. The `server-task.*` half is a rerere resolution; the call site is `patches/0004` because git auto-merges it to the PR's two-argument form. Unmeasured; the shape to test is a second slot holding a shorter prefix of a request the cache has in full.
 
 Not taken:
 
@@ -247,7 +247,7 @@ Two findings. First, #29166 is the cause of the garbled replies and is dropped. 
 
 Worth taking:
 
-- **[#29370](https://github.com/ggml-org/llama.cpp/pull/29370)** - **in the build.** `ggml-alloc` reuses a stale plan when a tensor's output flag changes; `build_sampling()` hits it whenever the set of active samplers changes, so with backend sampling and several slots the draft candidates get corrupted (issue #29313, EAGLE-3 acceptance 0.024 -> 0.112). We run `spec-draft-backend-sampling = 1` with 4 slots. Author states #28305 alone does not fix it and the two merge cleanly. Merged clean; `bench-slots.sh` passes 3/3 plus the #28992 case. Acceptance under concurrency unmeasured.
+- **[#29370](https://github.com/ggml-org/llama.cpp/pull/29370)** - **dropped 2026-11-16** (stale since 2026-09, conflicts in `llama-graph.cpp`, #29313 closed not planned). `ggml-alloc` reuses a stale plan when a tensor's output flag changes; `build_sampling()` hits it whenever the set of active samplers changes, so with backend sampling and several slots the draft candidates get corrupted (issue #29313, EAGLE-3 acceptance 0.024 -> 0.112). We run `spec-draft-backend-sampling = 1` with 4 slots. Author states #28305 alone does not fix it and the two merge cleanly. Merged clean; `bench-slots.sh` passes 3/3 plus the #28992 case. Acceptance under concurrency unmeasured.
 
 Tried and dropped:
 

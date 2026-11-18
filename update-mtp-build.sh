@@ -22,22 +22,6 @@ BRANCH="mtp-extras"
 #   28007 - falls back to full reprocessing when hybrid seq_rm refuses a rollback
 #           past the RS ring instead of aborting the server (upstream issue #27931).
 #           13 lines, safety only.
-#   28992 - get_available_slot() only consulted the prompt cache when the
-#           outgoing slot state was worth saving (f_keep < 0.5), so a slot
-#           holding a shorter prefix of the request kept it even when the cache
-#           held a longer one, and an empty slot divided by zero. Splits the
-#           search out of load() as find_better()/has_better() and asks the
-#           cache before deciding. The can_cache gate uses master's
-#           !task.is_stateless() (#30498) rather than the PR's completion-only check.
-#           Since #30779 (2026-11-07) load() reads lcp_best, which the PR moves into
-#           find_better(); patches/0006 recomputes it there.
-#   29370 - ggml-alloc re-plans when a tensor's input/output flag changes, and
-#           build_sampling() marks inactive samplers as outputs too. Without it the
-#           allocator reuses a stale plan whenever the set of sampling slots
-#           changes, corrupting draft candidates under backend sampling with
-#           several slots (issue #29313). Its tests collide with master's
-#           alloc_buffer_n tests (#23671) in tests/test-alloc.cpp; both sides
-#           are additive, rerere keeps both.
 # Ported rather than merged: 28333 (zeroes the MTP carrier at sequence start, so
 # identical deterministic requests stop diverging against a long-lived server) is
 # patches/0005 because master's batch_ext migration (#29385/#29601) rewrote the
@@ -84,6 +68,13 @@ BRANCH="mtp-extras"
 # Dropped 2026-10-28: 28785 (ggml-cpu skips the threadpool wake-up when the graph
 # has no CPU work) - measured null 2026-09-13 on short decode (57.2 vs 56.7-57.4)
 # and cold prefill (777.9 vs 783.2 tok/s); only added merge surface.
+# Dropped 2026-11-16: 28992 (prompt-cache lookup when the slot's f_keep >= 0.5)
+# and 29370 (ggml-alloc stale plan on output-flag change, issue #29313). Both open,
+# unreviewed, untouched since 2026-09 and conflicting with master; #29313 closed
+# not planned on 2026-11-08. #32154 moved the prompt cache and slot selection into
+# server-slot-sched.cpp, which also stopped the empty-slot 0/0 that 28992 fixed.
+# patches/0006 only existed to fix up 28992 and went with it. 28992's cache check
+# (the bug #32154 did not fix) is ported onto server-slot-sched.cpp as patches/0007.
 # Dropped 2026-10-28: 28022 (--sleep-preserve-cache, prompt cache survives idle
 # sleep; 38.1 s -> 0.08 s on wake) and 28092 (--cache-dir, prompt cache persists to
 # disk across restarts; 39.7 s -> 0.09 s). Both open but unreviewed and stalled
@@ -107,7 +98,7 @@ BRANCH="mtp-extras"
 # qwen4exp changes, and was already disabled at runtime by LLAMA_QSA_NO_POOLED_CACHE=1
 # because it aborts with two slots on the unified cache. Retake it once it rebases
 # onto master and passes bench-slots.sh.
-EXTRA_PRS=(28007 28992 29370)
+EXTRA_PRS=(28007)
 MARKER="${WORKTREE}/.last-mtp-build"
 
 die() {
