@@ -1,8 +1,8 @@
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index b8d5a9057..bdaa369a1 100644
+index 9e0198bd2..bf582de27 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -3004,8 +3004,13 @@ private:
+@@ -3016,8 +3016,13 @@ private:
                          }
                      }
  
@@ -18,7 +18,7 @@ index b8d5a9057..bdaa369a1 100644
                      }
  
 diff --git a/tools/server/server-slot-sched.cpp b/tools/server/server-slot-sched.cpp
-index 5f8aa5c33..ec7dc58fd 100644
+index 9f9779348..f8eebd1e3 100644
 --- a/tools/server/server-slot-sched.cpp
 +++ b/tools/server/server-slot-sched.cpp
 @@ -164,11 +164,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
@@ -60,10 +60,10 @@ index 5f8aa5c33..ec7dc58fd 100644
 +    auto it_best = find_better(prompt, tokens_new, lora_new);
 +
 +    if (it_best != states.end()) {
-         {
-             auto & data = it_best->data.main;
+         const int64_t t_start = ggml_time_us();
  
-@@ -245,7 +256,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+         {
+@@ -247,7 +258,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
          SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
  
          // the whole cached prompt is a prefix of the new one
