@@ -21,8 +21,10 @@ Three things llama-server's own scanner cannot do:
    Kept out of the farm entirely:
      - MTP head stubs  - nextn tensors but only a handful of blocks; a head is
                          a draft for some other model, not a model
-     - DFlash drafts   - arch = dflash; wire one by hand in the base ini via
-                         spec-type = draft-dflash (example in samm-mbp.ini)
+     - DFlash drafts   - arch = dflash. A DSpark draft (dflash.dspark.* keys)
+                         is paired to its target by name, like an MTP head;
+                         other DFlash variants are wired by hand in the base
+                         ini via spec-type = draft-dflash (example in samm-mbp.ini)
      - diffusion archs - cannot load in llama-server at all; listed in
                          .generated/diffusion-models.tsv for llama-diffusion-cli
 
@@ -98,7 +100,7 @@ class Config:
     # PrismML ternary quants: only their llama.cpp fork loads these (and the official
     # llama-gguf aborts on them), so they run via run-llama-server.sh --bonsai.
     fork_only_quant: str = r"(?i)[._-]P(?:T?Q)[0-9]+_[0-9]+\.gguf$"
-    cache_version: int = 6  # probe-cache schema; bump to invalidate old caches
+    cache_version: int = 8  # probe-cache schema; bump to invalidate old caches
 
     # --- Size-tier thresholds, in GB (env: SIZE_SMALL_KV_GB / SIZE_CKPT_GB) ---
     # They stack: a model can match more than one tier. See SIZE_TIERS for wiring.
@@ -196,6 +198,7 @@ class Config:
 class ModelKind(Enum):
     EMBEDDED_MTP = auto()  # nextn in the model (Qwen): self-drafts, inherits [*]
     PAIRED = auto()  # no nextn, separate head exists (Gemma 4): spec-draft-model
+    DSPARK = auto()  # no MTP, DSpark draft exists (Inkling): spec-draft-model
     NGRAM = auto()  # no MTP at all: model-free ngram speculation fallback
     NO_SPEC = auto()  # embedding model; speculation is meaningless
     DECISION = auto()  # System One decision model (<arch>.decision.type): no generation
@@ -204,6 +207,7 @@ class ModelKind(Enum):
 KIND_SPEC: dict[ModelKind, str] = {
     # Re-stated (not inherited) so the pairing is readable in one section.
     ModelKind.PAIRED: "draft-mtp",
+    ModelKind.DSPARK: "draft-dspark",
     # Replaces the inherited draft-mtp, which would abort the load. No draft
     # model needed - it drafts from recent-context n-grams.
     ModelKind.NGRAM: "ngram-mod",
@@ -342,6 +346,9 @@ class ProbeResult:
     embed: bool  # carries <arch>.pooling_type -> an embedding model
     dflash: bool  # arch = dflash -> a speculative draft, not a runnable model
     decision: bool  # carries <arch>.decision.type -> a /v1/systemone decision model
+    dspark: bool = False  # dflash arch + dflash.dspark.* keys -> a DSpark draft
+    dspark_conf: bool = False  # DSpark draft with a confidence head (conf_proj)
+    dspark_foreign: bool = False  # DSpark keys, but a head llama.cpp cannot load
     ok: bool = True  # False = never probed; every flag above is "unknown", not "no"
 
 
@@ -384,7 +391,7 @@ class Prober:
                     ok=False,
                 )
             self.cache[key] = val
-        cnt, blk, dif, emb, dfl, dec = self._parse(val)
+        cnt, blk, dif, emb, dfl, dec, dsp = self._parse(val)
         nextn = cnt > 0
         return ProbeResult(
             nextn=nextn,
@@ -393,6 +400,9 @@ class Prober:
             embed=emb > 0,
             dflash=dfl > 0,
             decision=dec > 0,
+            dspark=dsp in (1, 2),
+            dspark_conf=dsp == 2,
+            dspark_foreign=dsp == 3,
         )
 
     def _probe_raw(self, f: Path) -> str | None:
@@ -412,7 +422,21 @@ class Prober:
         dfl = 1 if arch == "dflash" else 0
         emb = 1 if any(".pooling_type" in ln for ln in out.splitlines()) else 0
         dec = 1 if any(".decision.type" in ln for ln in out.splitlines()) else 0
-        return f"{cnt}:{blk}:{dif}:{emb}:{dfl}:{dec}"
+        # 0 = not DSpark, 1 = DSpark, 2 = DSpark with a confidence head,
+        # 3 = DSpark whose Markov head llama.cpp cannot load. Heads are read off
+        # their tensors: llama-gguf prints key names, not values, so
+        # dflash.has_confidence_head itself is unreadable here. llama.cpp
+        # requires markov_w2; Unsloth's fork-only drafts (Inkling 2 Mini) ship
+        # a different head without it and abort the target's load.
+        dsp = 0
+        if dfl and ".dspark." in out:
+            if not re.search(r"name = markov_w2\.", out):
+                dsp = 3
+            elif re.search(r"name = conf_proj\.", out):
+                dsp = 2
+            else:
+                dsp = 1
+        return f"{cnt}:{blk}:{dif}:{emb}:{dfl}:{dec}:{dsp}"
 
     def _run_gguf(self, f: Path) -> str | None:
         """llama-gguf's dump for f, or None if it did not run cleanly.
@@ -440,7 +464,7 @@ class Prober:
         return r.stdout or ""
 
     @staticmethod
-    def _parse(val: str) -> tuple[int, int, int, int, int, int]:
+    def _parse(val: str) -> tuple[int, int, int, int, int, int, int]:
         # Pad older short cache entries with zeros; treat any garbage as 0
         # (a corrupt cache degrades to "unknown", it never crashes the run).
         def to_int(x: str) -> int:
@@ -449,8 +473,8 @@ class Prober:
             except ValueError:
                 return 0
 
-        p = [to_int(x) for x in (val.split(":") + ["0"] * 6)[:6]]
-        return (p[0], p[1], p[2], p[3], p[4], p[5])
+        p = [to_int(x) for x in (val.split(":") + ["0"] * 7)[:7]]
+        return (p[0], p[1], p[2], p[3], p[4], p[5], p[6])
 
     def save_cache(self) -> None:
         lines = [f"{k}\t{v}" for k, v in sorted(self.cache.items())]
@@ -458,15 +482,15 @@ class Prober:
 
 
 # --------------------------------------------------------------------------
-# Model records. spec-draft-model only exists for PAIRED, so it hangs off the
-# record, not a side table.
+# Model records. spec-draft-model only exists for PAIRED and DSPARK, so it
+# hangs off the record, not a side table.
 # --------------------------------------------------------------------------
 @dataclass
 class Model:
     name: str
     kind: ModelKind
     tags: list[str] = field(default_factory=list)
-    draft_head: Path | None = None
+    draft_model: Path | None = None
     overrides: dict[str, str] = field(default_factory=dict)
 
 
@@ -502,7 +526,9 @@ def normalise(name: str) -> str:
     s = re.sub(r"[._-]i?q[0-9]+(_[0-9a-z]+)*", "", s)
     s = re.sub(r"[._-](ud|k_xl|k_m|k_s|k_l|f16|bf16|fp16|f32|mxfp4|i1|imatrix)", "", s)
     s = s.replace("_", "-")
-    tokens = [t for t in s.split("-") if t and t not in ("mtp", "qat", "gguf")]
+    tokens = [
+        t for t in s.split("-") if t and t not in ("mtp", "dspark", "qat", "gguf")
+    ]
     return "-".join(tokens)
 
 
@@ -561,6 +587,7 @@ class Sync:
         self.cfg = cfg
         self.prober = Prober(cfg)
         self.head_index: dict[str, Path] = {}
+        self.dspark_index: dict[str, Path] = {}
         self.models: list[Model] = []
         self.diffusion: list[tuple[str, Path]] = []
         self.linked = 0
@@ -675,16 +702,26 @@ class Sync:
             head = None
             overrides.update(mtp_draft_overrides(name))
         else:
-            head = self.head_index.get(normalise(match))
+            key = normalise(match)
+            head = self.head_index.get(key)
+            dspark = self.dspark_index.get(key)
             if head is not None:
                 kind, tags = ModelKind.PAIRED, tags + ["MTP"]
+            elif dspark is not None:
+                # After an MTP head on purpose: the only like-for-like measure
+                # (Qwen3.8-27B) had MTP beating a DFlash-family draft.
+                kind, tags, head = ModelKind.DSPARK, tags + ["DSpark"], dspark
+                if not self.prober.probe(dspark).dspark_conf:
+                    # DSpark reads p-min as its confidence-head cutoff and
+                    # refuses to load without that head while [*] p-min > 0.
+                    overrides["spec-draft-p-min"] = "0"
             elif is_embed:
                 kind = ModelKind.NO_SPEC
             else:
                 kind, tags = ModelKind.NGRAM, tags + ["ngram"]
 
         model = Model(
-            name=name, kind=kind, tags=tags, draft_head=head, overrides=overrides
+            name=name, kind=kind, tags=tags, draft_model=head, overrides=overrides
         )
         self.models.append(model)
         return model
@@ -752,7 +789,8 @@ class Sync:
                 shutil.rmtree(p)
 
     def _index_heads(self) -> None:
-        """Pass 1: index standalone MTP heads by their normalised base name.
+        """Pass 1: index standalone MTP heads and DSpark drafts by their
+        normalised base name (dspark-Inkling-2-Mini-Q8_0 -> inkling-2-mini).
 
         More than one head can normalise to the same base (e.g. a quantised head
         beside the weights AND a purpose-named mtp- stub). Pick deterministically:
@@ -760,6 +798,7 @@ class Sync:
         name - never by directory-walk order, which is unspecified.
         """
         candidates: dict[str, list[Path]] = {}
+        dsparks: dict[str, list[Path]] = {}
         for g in iter_ggufs(self.cfg.src):
             b = g.name
             if "mmproj" in b or "-of-" in b:  # mmproj / shards are never heads
@@ -768,10 +807,20 @@ class Sync:
                 continue
             if self._is_head(g):
                 candidates.setdefault(normalise(b), []).append(g)
+            elif self.prober.probe(g).dspark:
+                dsparks.setdefault(normalise(b), []).append(g)
+            elif self.prober.probe(g).dspark_foreign:
+                print(
+                    f"warning: '{g}' is a DSpark draft llama.cpp cannot load "
+                    "(no markov_w2; fork-only format); not pairing it.",
+                    file=sys.stderr,
+                )
         for key, heads in candidates.items():
             self.head_index[key] = min(
                 heads, key=lambda p: (not p.name.startswith("mtp-"), p.name)
             )
+        for key, drafts in dsparks.items():
+            self.dspark_index[key] = min(drafts, key=lambda p: p.name)
 
     def _build_farm(self) -> None:
         """Pass 2: build the model farm and classify each model for MTP.
@@ -906,6 +955,7 @@ class Sync:
         c = self.cfg
         mtp = [m for m in self.models if m.kind is ModelKind.EMBEDDED_MTP]
         paired = [m for m in self.models if m.kind is ModelKind.PAIRED]
+        dspark = [m for m in self.models if m.kind is ModelKind.DSPARK]
         ngram = [m for m in self.models if m.kind is ModelKind.NGRAM]
         nospec = [m for m in self.models if m.kind is ModelKind.NO_SPEC]
         decision = [m for m in self.models if m.kind is ModelKind.DECISION]
@@ -919,8 +969,8 @@ class Sync:
             spec = KIND_SPEC.get(m.kind)
             if spec is not None:
                 out += f"{'spec-type'.ljust(16)} = {spec}\n"
-            if m.draft_head is not None:
-                out += f"{'spec-draft-model'.ljust(16)} = {m.draft_head}\n"
+            if m.draft_model is not None:
+                out += f"{'spec-draft-model'.ljust(16)} = {m.draft_model}\n"
             if m.tags:
                 out += f"tags = {','.join(m.tags)}\n"
             out += "".join(f"{k.ljust(16)} = {v}\n" for k, v in m.overrides.items())
@@ -937,8 +987,8 @@ class Sync:
             f";   above {c.ckpt_gb} GB: ctx-checkpoints = {c.ckpt_checkpoints}, ctx-size = {c.ckpt_ctx_size}\n"
             f";   Qwen {c.qwen_template_min[0]}.{c.qwen_template_min[1]}+ chat-template-file = {c.qwen_template}\n"
             "; Not listed here: diffusion-arch models (router cannot load them - see\n"
-            "; .generated/diffusion-models.tsv, run under llama-diffusion-cli) and DFlash\n"
-            "; drafts (wire manually in the base ini via spec-type = draft-dflash).\n"
+            "; .generated/diffusion-models.tsv, run under llama-diffusion-cli) and non-DSpark\n"
+            "; DFlash drafts (wire manually in the base ini via spec-type = draft-dflash).\n"
             "; ===================================================================="
         )
 
@@ -952,6 +1002,11 @@ class Sync:
         if paired:
             parts.append("\n\n; --- base models paired with a separate MTP head ---")
             for m in paired:
+                parts.append(f"\n\n[{m.name}]\n{emit(m)}".rstrip("\n"))
+
+        if dspark:
+            parts.append("\n\n; --- no MTP: paired with a DSpark draft ---")
+            for m in dspark:
                 parts.append(f"\n\n[{m.name}]\n{emit(m)}".rstrip("\n"))
 
         if ngram:
@@ -981,13 +1036,14 @@ class Sync:
     def _summary(self) -> None:
         mtp = sum(1 for m in self.models if m.kind is ModelKind.EMBEDDED_MTP)
         paired = sum(1 for m in self.models if m.kind is ModelKind.PAIRED)
+        dspark = sum(1 for m in self.models if m.kind is ModelKind.DSPARK)
         ngram = sum(1 for m in self.models if m.kind is ModelKind.NGRAM)
         nospec = sum(1 for m in self.models if m.kind is ModelKind.NO_SPEC)
         decision = sum(1 for m in self.models if m.kind is ModelKind.DECISION)
         size_tiered = self.size_tiered
         print(
             f"linked {self.linked} model(s): {mtp} embedded-MTP, {paired} base+head paired, "
-            f"{ngram} ngram fallback, {nospec} no-spec (embeddings), {decision} decision, "
+            f"{dspark} DSpark paired, {ngram} ngram fallback, {nospec} no-spec (embeddings), {decision} decision, "
             f"{size_tiered} size-tiered, "
             f"{self.templated} Qwen chat-template fix, "
             f"{self.nommproj_twins} no-mmproj twin(s); skipped {self.skipped_heads} MTP head(s), "
