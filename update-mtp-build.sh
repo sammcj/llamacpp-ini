@@ -74,7 +74,8 @@ BRANCH="mtp-extras"
 # not planned on 2026-11-08. #32154 moved the prompt cache and slot selection into
 # server-slot-sched.cpp, which also stopped the empty-slot 0/0 that 28992 fixed.
 # patches/0006 only existed to fix up 28992 and went with it. 28992's cache check
-# (the bug #32154 did not fix) is ported onto server-slot-sched.cpp as patches/0007.
+# (the bug #32154 did not fix) was ported onto server-slot-sched.cpp as patches/0007,
+# retired 2026-11-27 once 28992 itself merged (2026-11-24 as 82dd97047).
 # Dropped 2026-10-28: 28022 (--sleep-preserve-cache, prompt cache survives idle
 # sleep; 38.1 s -> 0.08 s on wake) and 28092 (--cache-dir, prompt cache persists to
 # disk across restarts; 39.7 s -> 0.09 s). Both open but unreviewed and stalled

@@ -6,7 +6,6 @@ Regenerate after changing them by hand:
 
     git -C ~/git/llama.cpp-pr27836 diff -- tools/server/server-context.cpp > patches/0001-server-context-local.patch
     git -C ~/git/llama.cpp-pr27836 diff -- common/speculative.cpp > patches/0005-speculative-mtp-zero-carrier.patch
-    git -C ~/git/llama.cpp-pr27836 diff -- tools/server/server-slot-sched.cpp tools/server/server-slot-sched.h tools/server/server-context.cpp > patches/0007-slot-sched-cache-check.patch
 
 If two patches ever touch the same file, regenerate them one hunk at a time (stage the other first, then `git diff` gives only the unstaged hunk). On 2026-10-17 a `--3way` fallback on one patch silently dropped another's hunk in the same file, so the script now stops if any patch is missing from the tree after applying.
 
@@ -48,7 +47,9 @@ One line, in `tools/server/server-task.cpp`. Fix-up for #28992 on top of master.
 
 **Recompute the prefix length for the full-restore tag.** #30779 (merged 2026-11-07) tracks `lcp_best` in `server_prompt_cache::load()` to log `__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__`. #28992 moves the search, and `lcp_best` with it, into `find_better()`, so the merged `load()` refers to an undeclared variable. The conflict at the function header is a rerere resolution (`find_better()` with a non-const `lcp_best`, since master's loop assigns it); this line sits outside that hunk, so rerere cannot carry it. Drop when #28992 rebases past #30779. Fails to apply, and stops the build, if #28992 does not merge.
 
-## 0007-slot-sched-cache-check.patch
+## 0007-slot-sched-cache-check.patch (retired 2026-11-27)
+
+Retired when #28992 merged upstream (2026-11-24 as `82dd97047`). The merged version moves the `has_better()` check into `server_slot_sched::select()` instead of the launch site, makes `find_better()` const and returns the prefix length from it. Original notes follow.
 
 Touches `tools/server/server-slot-sched.cpp`, `server-slot-sched.h` and `server-context.cpp`. Port of #28992's cache check onto master after #32154 moved the prompt cache and slot selection into `server-slot-sched.cpp`.
 
